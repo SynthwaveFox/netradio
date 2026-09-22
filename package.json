@@ -1,0 +1,13 @@
+{
+  "name": "radio-server",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Live netradio for VRChat: one shared playhead, Icecast-style MP3 stream, song intros and bumpers",
+  "main": "netradio.js",
+  "scripts": {
+    "start": "node netradio.js",
+    "live": "node netradio.js",
+    "icecast": "node server.cjs"
+  },
+  "type": "module"
+}
