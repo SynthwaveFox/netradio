@@ -165,7 +165,7 @@ Console commands (type into the Pterodactyl console or the terminal):
 | `import <url> [folder] [max]` / `imports` / `spotify` / `ytdlp` | import a Spotify/YouTube playlist into `songs/<folder>` (see Importing) |
 | `intros` | song-intro coverage report + `missing-intros.txt` |
 | `process` | process everything in `intros/raw/` now |
-| `check` / `check all` | test-decode bumpers+intros (/ +songs) with the container's ffmpeg |
+| `check` / `check all` / `check <playlist>` | full test-decode of bumpers+intros / everything in every playlist / one playlist's songs; reports FAIL with the decoder error |
 | `queue`, `listeners`, `reload`, `stop`, `help` | |
 
 Seeking restarts that track's decoder at the new position; listeners hear a clean cut

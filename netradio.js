@@ -1593,9 +1593,16 @@ async function main() {
     },
     process: () => { rawProcessor.scan(true).catch(e => logErr(e.message)); return `processing ${CONFIG.rawIntrosDir}`; },
     check: arg => {
-      // Decode every bumper/intro (and songs with "check all") with the container's ffmpeg.
+      // check            bumpers + song intros
+      // check all        + every song in every playlist
+      // check <playlist> songs of that playlist only
       scheduler.refresh();
-      const files = [...scheduler.genericBumpers, ...scheduler.songIntroMap.values(), ...(arg === 'all' ? scheduler.songPool : [])];
+      const which = arg.trim().toLowerCase();
+      let files;
+      if (!which) files = [...scheduler.genericBumpers, ...scheduler.songIntroMap.values()];
+      else if (which === 'all') files = [...scheduler.genericBumpers, ...scheduler.songIntroMap.values(), ...new Set([...scheduler.playlists.values()].flat())];
+      else if (scheduler.playlists.has(which)) files = scheduler.playlists.get(which);
+      else return `no playlist "${which}" (have: ${[...scheduler.playlists.keys()].join(', ')}) — or use: check | check all`;
       if (!files.length) return 'nothing to check';
       logInfo(`checking ${files.length} file(s) (full decode)...`);
       let i = 0;
@@ -1622,7 +1629,7 @@ async function main() {
       return '';
     },
     stop: () => { shutdown(); return ''; },
-    help: () => 'commands: skip | play <song> [now] | seek +30 | seek 1:30 | now | queue | playlists | playlist <name> [now] | import <url> [folder] | imports | spotify | ytdlp | listeners | check [all] | intros | process | reload | stop',
+    help: () => 'commands: skip | play <song> [now] | seek +30 | seek 1:30 | now | queue | playlists | playlist <name> [now] | import <url> [folder] | imports | spotify | ytdlp | listeners | check [all|<playlist>] | intros | process | reload | stop',
   };
   process.stdin.on('data', chunk => {
     for (const line of chunk.toString().split(/\r?\n/)) {
