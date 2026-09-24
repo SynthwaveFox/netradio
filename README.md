@@ -26,10 +26,13 @@ songs/            music library (mp3/flac/wav/m4a/aac/ogg/opus)
 songs/<name>/     a playlist named <name> (scanned recursively); loose files in songs/ = "default"
 intros/songs/     optional song-specific intros, named like the song: "artist-title.mp3"
 intros/generic/   generic bumpers, one is played before songs (see BUMPER_EVERY)
+intros/hourly/          top-of-hour time checks, one per hour: 0..23 or 1am..12pm
 intros/raw/             unprocessed bumpers: echo effect + gain     → intros/generic/
 intros/raw/clean/       gain only (no echo)                         → intros/generic/
 intros/raw/songs/       unprocessed song intros: echo + gain        → intros/songs/
 intros/raw/songs/clean/ gain only                                   → intros/songs/
+intros/raw/hourly/      unprocessed time checks                     → intros/hourly/
+intros/raw/hourly/clean/ gain only                                  → intros/hourly/
 ```
 
 All folders are rescanned before every playout block, so files added or removed over
@@ -90,6 +93,27 @@ HTTP: `POST /import?token=…&url=…&folder=…[&limit=N]`.
 - If YouTube blocks the server's IP ("Sign in to confirm you're not a bot"), export cookies
   from a logged-in browser to a file and set `YTDLP_COOKIES=/home/container/cookies.txt`.
 - Downloads run one at a time at low priority; expect ~10 s per track.
+
+### Top-of-hour time checks (`intros/hourly/`)
+
+A clip per hour ("Good evening, the time is nine o'clock…"). At the first break after the
+hour turns, that hour's clip replaces the generic bumper — once per hour. A song playing
+across the hour is never cut off; the check simply waits for the break.
+
+Name each file for its hour: `0.mp3` … `23.mp3`, or `1am.mp3` … `12pm.mp3`. An optional
+`hour-` prefix and a `-suffix` are ignored, so `hour-21-evening.mp3` is also 9pm. Several
+files for the same hour are picked between at random. Record them raw into
+`intros/raw/hourly/` (or `…/hourly/clean/`) for the usual processing.
+
+- The clock follows `STATION_TZ` (default `America/New_York`), never the container's `TZ`
+  (Pterodactyl sets that to UTC). The startup banner prints the station time — check it.
+- If the break lands more than `HOURLY_GRACE_MINUTES` (default 20) past the hour, the check
+  is skipped rather than announcing a time that is already wrong.
+- It fires once per hour even across restarts (`hourly-state.json`).
+- Hours with no clip are simply skipped; you do not need all 24 to start.
+- `hourly` in the console shows coverage, the station time, and this hour's status.
+- `hourly play` / `hourly play 21` plays a time check at the next break for testing, without
+  using up the real one for this hour.
 
 ### Song-specific intros (`intros/songs/`)
 
@@ -164,6 +188,7 @@ Console commands (type into the Pterodactyl console or the terminal):
 | `playlists` / `playlist <name> [now]` | list / switch playlists (see Playlists) |
 | `import <url> [folder] [max]` / `imports` / `spotify` / `ytdlp` | import a Spotify/YouTube playlist into `songs/<folder>` (see Importing) |
 | `intros` | song-intro coverage report + `missing-intros.txt` |
+| `hourly` / `hourly play [hour]` | time-check coverage and station time / force one at the next break to test |
 | `process` | process everything in `intros/raw/` now |
 | `check` / `check all` / `check <playlist>` | full test-decode of bumpers+intros / everything in every playlist / one playlist's songs; reports FAIL with the decoder error |
 | `queue`, `listeners`, `reload`, `stop`, `help` | |
@@ -191,7 +216,9 @@ treat it as a proper Icecast mount.
 | `NORMALIZE=peak` | | alternative: align every track's true peak to `NORMALIZE_PEAK` instead of its loudness. Simpler, but a dynamic voice clip and a compressed song at the same peak differ a lot in perceived volume |
 | `NORMALIZE_TARGET` | `-16` | target LUFS (loudness mode) |
 | `NORMALIZE_PEAK` | `-1` | true-peak ceiling in dBTP; a quiet track with big peaks gets less gain rather than clipping |
-| `BUMPER_OFFSET_DB` | `-3` | bumpers and song intros are levelled this many dB below the songs |
+| `BUMPER_OFFSET_DB` | `-3` | bumpers, song intros and time checks are levelled this many dB below the songs |
+| `STATION_TZ` | `America/New_York` | station clock: log timestamps and the top-of-hour time checks. Use a zone name (`America/Chicago`), which handles daylight saving; the container's own `TZ` is deliberately ignored |
+| `HOURLY_GRACE_MINUTES` | `20` | skip the time check if the break comes later than this past the hour |
 | `VOLUME` | `1` | extra linear gain |
 | `BURST_SECONDS` | `8` | audio sent instantly to a new listener. This is the player's cushion against jitter; every listener starts from the beginning of it, so it delays everyone equally and does not loosen sync. Too small (< 5) makes AVPro stutter and re-sync a few seconds in |
 | `STATION_NAME`, `STATION_DESCRIPTION`, `STATION_GENRE` | Gizmo Radio… | icy headers |

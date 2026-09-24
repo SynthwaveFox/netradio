@@ -166,3 +166,36 @@ Plain, warm, late-night radio register. No puns, no gimmicks.
 138. 84.5 FM, Starlight Radio. We'll be here all night.
 139. You're listening to Starlight Radio, 84.5 FM. Here's what's next.
 140. Starlight Radio, 84.5 FM. Thanks for listening.
+
+## Top-of-hour time checks (`intros/hourly/`)
+
+One per hour, named `0.mp3` … `23.mp3` (or `12am.mp3` … `11pm.mp3`). Read them a little
+slower and warmer than the station IDs — this is the one moment the station talks to
+someone who has been there a while.
+
+| File | Script |
+|---|---|
+| 0 (12am) | Midnight at the Starlight Arcade. You're listening to 84.5 FM, Starlight Radio. |
+| 1 (1am) | It's one in the morning. Still here, still playing — 84.5 FM, Starlight Radio. |
+| 2 (2am) | Two AM. The machines are still warm. This is 84.5 FM, Starlight Radio. |
+| 3 (3am) | It's three in the morning, and nobody here is admitting they're tired. 84.5 FM. |
+| 4 (4am) | Four AM at the Starlight. You're listening to 84.5 FM, Starlight Radio. |
+| 5 (5am) | Good morning. It's five o'clock. 84.5 FM, Starlight Radio. |
+| 6 (6am) | Good morning — six AM at the Starlight Arcade. This is 84.5 FM. |
+| 7 (7am) | Good morning. The time is seven o'clock. You're with 84.5 FM, Starlight Radio. |
+| 8 (8am) | Good morning. It's eight AM. Starlight Radio, 84.5 FM. |
+| 9 (9am) | Good morning. Nine o'clock at the Starlight Arcade — 84.5 FM. |
+| 10 (10am) | It's ten in the morning. You're listening to 84.5 FM, Starlight Radio. |
+| 11 (11am) | Eleven AM. Starlight Radio, 84.5 FM. |
+| 12 (12pm) | Good afternoon. It's noon at the Starlight Arcade. 84.5 FM, Starlight Radio. |
+| 13 (1pm) | Good afternoon. The time is one o'clock. You're with 84.5 FM. |
+| 14 (2pm) | Two in the afternoon. Starlight Radio, 84.5 FM. |
+| 15 (3pm) | Good afternoon — it's three o'clock at the Starlight. 84.5 FM, Starlight Radio. |
+| 16 (4pm) | Four PM. The after-school rush is officially your problem now. 84.5 FM. |
+| 17 (5pm) | Good evening. It's five o'clock at the Starlight Arcade. 84.5 FM, Starlight Radio. |
+| 18 (6pm) | Good evening. The time is six o'clock. You're listening to 84.5 FM. |
+| 19 (7pm) | Good evening — seven PM, and the place is filling up. Starlight Radio, 84.5 FM. |
+| 20 (8pm) | Good evening. It's eight o'clock at the Starlight. This is 84.5 FM. |
+| 21 (9pm) | Good evening. The time is nine o'clock. You're with 84.5 FM, Starlight Radio. |
+| 22 (10pm) | Ten PM at the Starlight Arcade. Still going — 84.5 FM, Starlight Radio. |
+| 23 (11pm) | Eleven o'clock. One hour left in the day, and plenty left in the night. 84.5 FM. |

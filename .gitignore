@@ -1,3 +1,11 @@
 *.mp3
 intros*
 songs*
+
+# generated at runtime
+.env
+loudness-cache.json
+hourly-state.json
+spotify-auth.json
+bin/
+hls/

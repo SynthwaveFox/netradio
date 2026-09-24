@@ -57,6 +57,18 @@ try {
   }
 } catch { /* ignore */ }
 
+// A timezone the platform actually knows, else null (so a typo cannot break the clock).
+function validTimezone(tz) {
+  if (!tz) return null;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return tz;
+  } catch {
+    console.error(`[config] unknown STATION_TZ "${tz}" — falling back to America/New_York`);
+    return null;
+  }
+}
+
 const CONFIG = {
   host: process.env.HOST || '0.0.0.0',
   port: Number(process.env.PORT || process.env.SERVER_PORT || 3722), // SERVER_PORT = Pterodactyl allocation
@@ -77,6 +89,10 @@ const CONFIG = {
   normalizeTarget: Number(process.env.NORMALIZE_TARGET || -16), // LUFS
   normalizePeak: Number(process.env.NORMALIZE_PEAK || -1),      // dBTP ceiling: gain is reduced rather than clipping
   bumperOffsetDb: Number(process.env.BUMPER_OFFSET_DB ?? -3),   // bumpers/intros sit this much below the songs
+
+  hourlyIntrosDir: process.env.HOURLY_INTROS_DIR || path.join(__dirname, 'intros', 'hourly'),
+  hourlyGraceMinutes: Number(process.env.HOURLY_GRACE_MINUTES || 20), // skip the time check if the break comes later than this
+  timezone: validTimezone(process.env.STATION_TZ) || 'America/New_York', // NOT process.env.TZ: containers set that to UTC
   bumperEvery: Number(process.env.BUMPER_EVERY || 1), // generic bumper before every Nth song (0 = never)
   playlist: process.env.PLAYLIST || 'default',   // songs/<folder> to play; 'default' = loose files in songs/; 'all'; or 'a,b'
 
@@ -122,12 +138,21 @@ const DECODER_LOW_WATER = PCM_BPS * 4;
 
 const COLORS = { reset: '\x1b[0m', green: '\x1b[32m', yellow: '\x1b[33m', red: '\x1b[31m', cyan: '\x1b[36m', magenta: '\x1b[35m' };
 
-function nowEST() {
-  return new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour12: false });
+// Log clock = station clock (CONFIG.timezone), so the log and the time checks can never
+// disagree about what hour it is.
+function stationClockString() {
+  const d = new Date();
+  const time = d.toLocaleString('en-US', { timeZone: CONFIG.timezone, hour12: false });
+  let zone = CONFIG.timezone;
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: CONFIG.timezone, timeZoneName: 'short' }).formatToParts(d);
+    zone = (parts.find(p => p.type === 'timeZoneName') || {}).value || zone;
+  } catch { /* keep the zone id */ }
+  return `${time} ${zone}`;
 }
 
 function stamp() {
-  return `${COLORS.cyan}[${nowEST()} EST]${COLORS.reset}`;
+  return `${COLORS.cyan}[${stationClockString()}]${COLORS.reset}`;
 }
 
 function logReq(req, status, extra = '') {
@@ -191,6 +216,57 @@ function shuffle(array) {
   return copy;
 }
 
+// ---------------------------------------------------------------------------
+// Top-of-hour time checks: intros/hourly/<hour>.mp3
+//
+// At the first break after the hour turns, the generic bumper (or song intro) is
+// replaced by that hour's clip — once per hour. A song playing across the hour is
+// never cut off; the announcement waits for the break. If that break comes more
+// than HOURLY_GRACE_MINUTES after the hour, the clip is skipped rather than
+// announcing a time that is already wrong.
+//
+// File names: 24-hour (0..23, 00..23) or 12-hour with am/pm (1am, 12pm, 9PM).
+// An optional "hour" prefix and a "-something" suffix are allowed, so
+// "hour-21-evening.mp3" and "21.mp3" both mean 9pm. Several files for the same
+// hour are picked between at random.
+// ---------------------------------------------------------------------------
+
+const HOURLY_STATE_FILE = path.join(__dirname, 'hourly-state.json');
+
+// "9pm" / "21" / "hour-21-evening" -> 21, or null
+function parseHourName(base) {
+  const m = /^(?:hour-?)?(\d{1,2})(am|pm)?(?:-.*)?$/.exec(normalizeName(base));
+  if (!m) return null;
+  let h = Number(m[1]);
+  const suffix = m[2];
+  if (suffix) {
+    if (h < 1 || h > 12) return null;
+    if (suffix === 'am') h = h === 12 ? 0 : h;
+    else h = h === 12 ? 12 : h + 12;
+  }
+  return h >= 0 && h <= 23 ? h : null;
+}
+
+// Local parts of `date` in the station's timezone.
+function stationNow(date = new Date()) {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: CONFIG.timezone, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  });
+  const p = {};
+  for (const { type, value } of fmt.formatToParts(date)) p[type] = value;
+  const hour = Number(p.hour) % 24;
+  return { key: `${p.year}-${p.month}-${p.day}T${String(hour).padStart(2, '0')}`, hour, minute: Number(p.minute) };
+}
+
+function readHourlyState() {
+  try { return JSON.parse(fs.readFileSync(HOURLY_STATE_FILE, 'utf8')); } catch { return {}; }
+}
+
+function writeHourlyState(state) {
+  try { fs.writeFileSync(HOURLY_STATE_FILE, JSON.stringify(state)); } catch (e) { logWarn(`could not save hourly state: ${e.message}`); }
+}
+
 function parsePlaylistSpec(spec) {
   return String(spec || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
 }
@@ -202,6 +278,10 @@ class RadioScheduler {
     this.active = parsePlaylistSpec(CONFIG.playlist);
     this.genericBumpers = [];
     this.songIntroMap = new Map();
+    this.hourlyMap = new Map();  // hour (0-23) -> [files]
+    const hourlyState = readHourlyState();
+    this.lastHourKey = hourlyState.lastHourKey || null;
+    this.lastHourWhy = hourlyState.why || null;
     this.queue = [];
     this.lastSong = null;
     this.songsSinceBumper = 0;
@@ -278,6 +358,18 @@ class RadioScheduler {
       getAudioFilesRecursive(CONFIG.songIntrosDir).map(f => [normalizeName(path.basename(f, path.extname(f))), f])
     );
 
+    this.hourlyMap = new Map();
+    for (const f of getAudioFilesRecursive(CONFIG.hourlyIntrosDir)) {
+      const h = parseHourName(path.basename(f, path.extname(f)));
+      if (h === null) {
+        if (!this.warnedHourly) logWarn(`intros/hourly: cannot read an hour from "${path.basename(f)}" — name it 0-23 or 1am..12pm`);
+        continue;
+      }
+      if (!this.hourlyMap.has(h)) this.hourlyMap.set(h, []);
+      this.hourlyMap.get(h).push(f);
+    }
+    this.warnedHourly = true;
+
     const pool = new Set(this.songPool);
     this.queue = this.queue.filter(f => pool.has(f));
     for (const f of this.songPool) {
@@ -323,6 +415,31 @@ class RadioScheduler {
     const song = this.getNextSong();
     if (!song) return [];
     return this.playoutItemsFor(song);
+  }
+
+  // The hour's clip if one is due at this break, else null. Marks the hour as done.
+  takeHourlyIntro() {
+    if (!this.hourlyMap.size) return null;
+    const now = stationNow();
+    if (now.key === this.lastHourKey) return null;          // already done this hour
+    const files = this.hourlyMap.get(now.hour);
+    if (!files || !files.length) {
+      this.markHourDone(now.key, 'no clip for this hour');   // do not retry all hour
+      return null;
+    }
+    if (now.minute > CONFIG.hourlyGraceMinutes) {
+      logInfo(`hourly: skipping the ${now.hour}:00 time check (break came ${now.minute} min late)`);
+      this.markHourDone(now.key, `skipped, break was ${now.minute} min late`);
+      return null;
+    }
+    this.markHourDone(now.key, 'played');
+    return pickRandom(files);
+  }
+
+  markHourDone(key, why) {
+    this.lastHourKey = key;
+    this.lastHourWhy = why;
+    writeHourlyState({ lastHourKey: key, why });
   }
 
   // [intro|bumper], song — for a given song file
@@ -663,12 +780,32 @@ class Playout extends EventEmitter {
   }
 
   advance() {
+    const endedKind = this.current ? this.current.kind : null;
     if (this.current) {
       this.current.destroy();
       this.history.unshift({ ...this.current.toJSON(), endedAt: new Date().toISOString() });
       this.history.length = Math.min(this.history.length, 50);
     }
     this.fill();
+
+    // Top-of-hour time check. Decided here, at the break itself, so the clip reflects the
+    // time it actually airs. Only between blocks (a song just ended, or we are starting up),
+    // so a song running past the hour is never interrupted — it just delays the check.
+    if (endedKind === null || endedKind === 'song') {
+      // A forced test clip takes this break; otherwise the real top-of-hour check.
+      const hourly = this.forcedHourly || this.scheduler.takeHourlyIntro();
+      this.forcedHourly = null;
+      if (hourly) {
+        const head = this.pending[0];
+        if (head && (head.kind === 'bumper' || head.kind === 'intro')) {
+          head.destroy();            // this break's bumper is replaced by the time check
+          this.pending.shift();
+        }
+        this.scheduler.songsSinceBumper = 0;
+        this.pending.unshift(new TrackSource(hourly, 'hourly').start());
+      }
+    }
+
     this.current = this.pending.shift() || null;
     if (this.current) {
       if (!this.current.startRequested) this.current.start();
@@ -749,6 +886,20 @@ class Playout extends EventEmitter {
   }
 
   // spec: "+30" / "-10" (relative seconds), "90" or "1:30" (absolute). Returns a message.
+  // Test helper: play an hour's time check at the next break without consuming the
+  // once-per-hour state, so a real check still fires when the hour turns.
+  forceHourly(hourArg) {
+    this.scheduler.refresh();
+    const map = this.scheduler.hourlyMap;
+    if (!map.size) return 'no time checks installed';
+    const hour = hourArg === '' ? stationNow().hour : parseHourName(hourArg);
+    if (hour === null) return `cannot read an hour from "${hourArg}" — use 0-23 or 1am..12pm`;
+    const files = map.get(hour);
+    if (!files || !files.length) return `no clip for hour ${hour} (have: ${[...map.keys()].sort((a, b) => a - b).join(' ')})`;
+    this.forcedHourly = pickRandom(files);
+    return `test: hour ${hour} (${path.basename(this.forcedHourly)}) plays at the next break, i.e. when the current song ends (skip past any bumper first)`;
+  }
+
   // Queue a specific song next (with its intro/bumper), or cut to it now.
   request(query, now = false) {
     const matches = this.scheduler.findSongs(query);
@@ -1167,6 +1318,7 @@ class RawProcessor {
     ensureDir(CONFIG.rawIntrosDir);
     ensureDir(CONFIG.rawCleanIntrosDir);
     ensureDir(path.join(CONFIG.rawIntrosDir, 'songs'));
+    ensureDir(path.join(CONFIG.rawIntrosDir, 'hourly'));
     this.timer = setInterval(() => this.scan().catch(e => logErr(`raw scan: ${e.message}`)), 5000);
     this.timer.unref();
     return this.scan();
@@ -1184,6 +1336,8 @@ class RawProcessor {
       { dir: CONFIG.rawCleanIntrosDir, echo: false, destDir: CONFIG.genericBumpersDir },
       { dir: path.join(CONFIG.rawIntrosDir, 'songs'), echo: true, destDir: CONFIG.songIntrosDir },
       { dir: path.join(CONFIG.rawIntrosDir, 'songs', 'clean'), echo: false, destDir: CONFIG.songIntrosDir },
+      { dir: path.join(CONFIG.rawIntrosDir, 'hourly'), echo: true, destDir: CONFIG.hourlyIntrosDir },
+      { dir: path.join(CONFIG.rawIntrosDir, 'hourly', 'clean'), echo: false, destDir: CONFIG.hourlyIntrosDir },
     ];
     const files = [];
     this.echoFor = this.echoFor || new Map();
@@ -1524,6 +1678,7 @@ async function main() {
     console.log(`${COLORS.cyan}Song intros:  ${CONFIG.songIntrosDir} (${scheduler.songIntroMap.size})${COLORS.reset}`);
     console.log(`${COLORS.cyan}Bumpers:      ${CONFIG.genericBumpersDir} (${scheduler.genericBumpers.length}, every ${CONFIG.bumperEvery} song(s))${COLORS.reset}`);
     console.log(`${COLORS.cyan}Encoder:      mp3 ${CONFIG.bitrate}k ${CONFIG.sampleRate}Hz, burst ${CONFIG.burstSeconds}s, normalize=${CONFIG.normalize ? 'on' : 'off'}${CONFIG.hls ? `, HLS at /hls/live.m3u8` : ''}${COLORS.reset}`);
+    console.log(`${COLORS.cyan}Station time: ${stationClockString()} (STATION_TZ=${CONFIG.timezone})${COLORS.reset}`);
     console.log(`${COLORS.cyan}Now playing:  http://localhost:${CONFIG.port}/now.json${COLORS.reset}`);
     if (!CONFIG.adminToken) console.log(`${COLORS.yellow}ADMIN_TOKEN not set: /skip and /reload disabled${COLORS.reset}`);
   });
@@ -1580,6 +1735,23 @@ async function main() {
     },
     listeners: () => [...broadcaster.listeners].map(l => `${l.remote} (${Math.round((Date.now() - l.connectedAt) / 1000)}s)`).join(', ') || 'none',
     queue: () => playout.status().upcoming.join('\n') || '(queue empty)',
+    hourly: arg => {
+      const parts = arg.trim().split(/\s+/).filter(Boolean);
+      if (parts.length && ['play', 'test'].includes(parts[0].toLowerCase())) {
+        return playout.forceHourly(parts.slice(1).join(' '));
+      }
+      scheduler.refresh();
+      if (!scheduler.hourlyMap.size) return `no time checks installed — drop files in ${path.relative(__dirname, CONFIG.hourlyIntrosDir)} named 0-23 or 1am..12pm`;
+      const have = [...scheduler.hourlyMap.keys()].sort((a, b) => a - b);
+      const missing = [];
+      for (let h = 0; h < 24; h += 1) if (!scheduler.hourlyMap.has(h)) missing.push(h);
+      const now = stationNow();
+      const done = now.key === scheduler.lastHourKey;
+      return `time checks: ${have.length}/24 hours covered (${have.map(h => `${h}${scheduler.hourlyMap.get(h).length > 1 ? `x${scheduler.hourlyMap.get(h).length}` : ''}`).join(' ')})`
+        + (missing.length ? `; missing: ${missing.join(' ')}` : '')
+        + ` | station time ${String(now.hour).padStart(2, '0')}:${String(now.minute).padStart(2, '0')} ${CONFIG.timezone}`
+        + ` | this hour: ${done ? `done (${scheduler.lastHourWhy || 'played'})` : scheduler.hourlyMap.has(now.hour) ? (now.minute > CONFIG.hourlyGraceMinutes ? 'too late, will skip' : 'due at the next break') : 'no clip'}`;
+    },
     intros: () => {
       // Which songs (in every playlist) have a song-specific intro, and which still need one.
       scheduler.refresh();
@@ -1599,8 +1771,9 @@ async function main() {
       scheduler.refresh();
       const which = arg.trim().toLowerCase();
       let files;
-      if (!which) files = [...scheduler.genericBumpers, ...scheduler.songIntroMap.values()];
-      else if (which === 'all') files = [...scheduler.genericBumpers, ...scheduler.songIntroMap.values(), ...new Set([...scheduler.playlists.values()].flat())];
+      const hourlyFiles = [...scheduler.hourlyMap.values()].flat();
+      if (!which) files = [...scheduler.genericBumpers, ...scheduler.songIntroMap.values(), ...hourlyFiles];
+      else if (which === 'all') files = [...scheduler.genericBumpers, ...scheduler.songIntroMap.values(), ...hourlyFiles, ...new Set([...scheduler.playlists.values()].flat())];
       else if (scheduler.playlists.has(which)) files = scheduler.playlists.get(which);
       else return `no playlist "${which}" (have: ${[...scheduler.playlists.keys()].join(', ')}) — or use: check | check all`;
       if (!files.length) return 'nothing to check';
@@ -1629,7 +1802,7 @@ async function main() {
       return '';
     },
     stop: () => { shutdown(); return ''; },
-    help: () => 'commands: skip | play <song> [now] | seek +30 | seek 1:30 | now | queue | playlists | playlist <name> [now] | import <url> [folder] | imports | spotify | ytdlp | listeners | check [all|<playlist>] | intros | process | reload | stop',
+    help: () => 'commands: skip | play <song> [now] | seek +30 | seek 1:30 | now | queue | playlists | playlist <name> [now] | import <url> [folder] | imports | spotify | ytdlp | listeners | check [all|<playlist>] | intros | hourly [play [hour]] | process | reload | stop',
   };
   process.stdin.on('data', chunk => {
     for (const line of chunk.toString().split(/\r?\n/)) {
