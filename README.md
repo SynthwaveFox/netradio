@@ -181,6 +181,7 @@ Console commands (type into the Pterodactyl console or the terminal):
 | | |
 |---|---|
 | `skip` | next track |
+| `bumper` / `bumper <name>` | play a random / specific generic bumper at the next break, in place of that break's bumper |
 | `play <song>` / `play <song> now` | queue a specific song next (with its intro/bumper) or cut to it now; matches any words in the file name across all playlists, lists candidates if ambiguous |
 | `seek +30` / `seek -10` | jump forward / back within the current track |
 | `seek 90` / `seek 1:30` | jump to an absolute position |

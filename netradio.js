@@ -792,17 +792,19 @@ class Playout extends EventEmitter {
     // time it actually airs. Only between blocks (a song just ended, or we are starting up),
     // so a song running past the hour is never interrupted — it just delays the check.
     if (endedKind === null || endedKind === 'song') {
-      // A forced test clip takes this break; otherwise the real top-of-hour check.
-      const hourly = this.forcedHourly || this.scheduler.takeHourlyIntro();
-      this.forcedHourly = null;
-      if (hourly) {
+      // A queued clip takes this break; otherwise the real top-of-hour check.
+      const forced = this.forcedBreak;
+      this.forcedBreak = null;
+      const hourly = forced ? null : this.scheduler.takeHourlyIntro();
+      const item = forced || (hourly ? { file: hourly, kind: 'hourly' } : null);
+      if (item) {
         const head = this.pending[0];
         if (head && (head.kind === 'bumper' || head.kind === 'intro')) {
-          head.destroy();            // this break's bumper is replaced by the time check
+          head.destroy();            // this break's bumper is replaced
           this.pending.shift();
         }
         this.scheduler.songsSinceBumper = 0;
-        this.pending.unshift(new TrackSource(hourly, 'hourly').start());
+        this.pending.unshift(new TrackSource(item.file, item.kind).start());
       }
     }
 
@@ -896,8 +898,32 @@ class Playout extends EventEmitter {
     if (hour === null) return `cannot read an hour from "${hourArg}" — use 0-23 or 1am..12pm`;
     const files = map.get(hour);
     if (!files || !files.length) return `no clip for hour ${hour} (have: ${[...map.keys()].sort((a, b) => a - b).join(' ')})`;
-    this.forcedHourly = pickRandom(files);
-    return `test: hour ${hour} (${path.basename(this.forcedHourly)}) plays at the next break, i.e. when the current song ends (skip past any bumper first)`;
+    const file = pickRandom(files);
+    this.forcedBreak = { file, kind: 'hourly' };
+    return `queued: hour ${hour} (${path.basename(file)}) plays at the next break, i.e. when the current song ends (skip past any bumper first)`;
+  }
+
+  // Queue a specific generic bumper (or a random one) for the next break.
+  queueBumper(query) {
+    this.scheduler.refresh();
+    const pool = this.scheduler.genericBumpers;
+    if (!pool.length) return 'no bumpers installed';
+    let file;
+    if (!query) {
+      file = pickRandom(pool);
+    } else {
+      const words = normalizeName(query).split('-').filter(Boolean);
+      const named = f => normalizeName(path.basename(f, path.extname(f)));
+      const exact = pool.filter(f => named(f) === words.join('-'));
+      const matches = exact.length ? exact : pool.filter(f => words.every(w => named(f).includes(w)));
+      if (!matches.length) return `no bumper matches "${query}"`;
+      if (matches.length > 1) {
+        return `${matches.length} bumpers match "${query}" — be more specific:${String.fromCharCode(10)}${matches.slice(0, 10).map(f => path.basename(f)).join(String.fromCharCode(10))}${matches.length > 10 ? `${String.fromCharCode(10)}…` : ''}`;
+      }
+      file = matches[0];
+    }
+    this.forcedBreak = { file, kind: 'bumper' };
+    return `queued: ${path.basename(file)} plays at the next break (when the current song ends)`;
   }
 
   // Queue a specific song next (with its intro/bumper), or cut to it now.
@@ -1713,6 +1739,7 @@ async function main() {
       return playout.setPlaylist(parts[0], now);
     },
     playlists: () => commands.playlist(''),
+    bumper: arg => playout.queueBumper(arg.trim()),
     import: arg => {
       if (!importer) return NO_IMPORTER;
       const [url, folder, limit] = arg.trim().split(/\s+/);
@@ -1802,7 +1829,7 @@ async function main() {
       return '';
     },
     stop: () => { shutdown(); return ''; },
-    help: () => 'commands: skip | play <song> [now] | seek +30 | seek 1:30 | now | queue | playlists | playlist <name> [now] | import <url> [folder] | imports | spotify | ytdlp | listeners | check [all|<playlist>] | intros | hourly [play [hour]] | process | reload | stop',
+    help: () => 'commands: skip | play <song> [now] | seek +30 | seek 1:30 | now | queue | bumper [name] | playlists | playlist <name> [now] | import <url> [folder] | imports | spotify | ytdlp | listeners | check [all|<playlist>] | intros | hourly [play [hour]] | process | reload | stop',
   };
   process.stdin.on('data', chunk => {
     for (const line of chunk.toString().split(/\r?\n/)) {
