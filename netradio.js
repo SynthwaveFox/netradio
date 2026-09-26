@@ -95,6 +95,7 @@ const CONFIG = {
   timezone: validTimezone(process.env.STATION_TZ) || 'America/New_York', // NOT process.env.TZ: containers set that to UTC
   bumperEvery: Number(process.env.BUMPER_EVERY || 1), // generic bumper before every Nth song (0 = never)
   playlist: process.env.PLAYLIST || 'default',   // songs/<folder> to play; 'default' = loose files in songs/; 'all'; or 'a,b'
+  playlistOrder: process.env.PLAYLIST_ORDER === 'sequential' ? 'sequential' : 'random', // startup default before any saved choice
 
   burstSeconds: Number(process.env.BURST_SECONDS || 8), // pre-roll sent to new listeners (player cushion)
   maxClientBacklog: Number(process.env.MAX_CLIENT_BACKLOG || 1024 * 1024), // drop slow clients
@@ -267,6 +268,31 @@ function writeHourlyState(state) {
   try { fs.writeFileSync(HOURLY_STATE_FILE, JSON.stringify(state)); } catch (e) { logWarn(`could not save hourly state: ${e.message}`); }
 }
 
+const PLAYLIST_STATE_FILE = path.join(__dirname, 'playlist-state.json');
+
+// The live playlist choice survives restarts; `playlist reset` goes back to .env.
+function readPlaylistState() {
+  try { return JSON.parse(fs.readFileSync(PLAYLIST_STATE_FILE, 'utf8')); } catch { return null; }
+}
+
+function writePlaylistState(state) {
+  try { fs.writeFileSync(PLAYLIST_STATE_FILE, JSON.stringify(state, null, 2)); } catch (e) { logWarn(`could not save playlist state: ${e.message}`); }
+}
+
+function clearPlaylistState() {
+  try { fs.unlinkSync(PLAYLIST_STATE_FILE); } catch { /* not there */ }
+}
+
+// "track2" before "track10", folders grouped
+const naturalOrder = new Intl.Collator('en', { numeric: true, sensitivity: 'base' });
+
+function parseOrderWord(word) {
+  const w = String(word).toLowerCase();
+  if (['sequential', 'seq', 'ordered', 'order', 'inorder'].includes(w)) return 'sequential';
+  if (['random', 'shuffle', 'shuffled'].includes(w)) return 'random';
+  return null;
+}
+
 function parsePlaylistSpec(spec) {
   return String(spec || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
 }
@@ -275,7 +301,12 @@ class RadioScheduler {
   constructor() {
     this.songPool = [];
     this.playlists = new Map();  // name -> files. Subfolders of songs/ are playlists; loose files are 'default'
-    this.active = parsePlaylistSpec(CONFIG.playlist);
+    const savedPlaylist = readPlaylistState();
+    this.active = parsePlaylistSpec((savedPlaylist && savedPlaylist.active && savedPlaylist.active.join(',')) || CONFIG.playlist);
+    this.order = (savedPlaylist && savedPlaylist.order) === 'sequential' ? 'sequential' : (savedPlaylist ? 'random' : CONFIG.playlistOrder);
+    this.restoredPlaylist = Boolean(savedPlaylist);
+    this.resumeAfter = (savedPlaylist && savedPlaylist.lastSong) || null;   // sequential: where we left off
+    this.seqCursor = this.resumeAfter;
     this.genericBumpers = [];
     this.songIntroMap = new Map();
     this.hourlyMap = new Map();  // hour (0-23) -> [files]
@@ -320,24 +351,51 @@ class RadioScheduler {
   }
 
   // Switch playlists. Returns a message. Takes effect at the next song (see Playout.setPlaylist).
-  setPlaylist(spec) {
+  // Called when a song actually starts playing (not when it is queued), so the resume
+  // point reflects what listeners heard rather than what was prefetched.
+  noteSongPlaying(file) {
+    if (this.order !== 'sequential' || this.resumeAfter === file) return;
+    this.resumeAfter = file;
+    this.savePlaylistState();
+  }
+
+  savePlaylistState() {
+    writePlaylistState({ active: this.active, order: this.order, lastSong: this.order === 'sequential' ? this.resumeAfter : null });
+  }
+
+  setPlaylist(spec, order = null) {
     const names = parsePlaylistSpec(spec);
-    if (!names.length) return 'usage: playlist <name> | playlist a,b | playlist all';
+    if (!names.length) return 'usage: playlist <name> [sequential|random] [now] | playlist reset';
     this.playlists = this.scanPlaylists();
     const unknown = names.filter(n => n !== 'all' && !this.playlists.has(n));
     if (unknown.length) return `no such playlist: ${unknown.join(', ')} (have: ${[...this.playlists.keys()].join(', ')})`;
     this.active = names;
+    if (order) this.order = order;
+    this.warnedMissing = false;
+    if (this.order === 'sequential') { this.lastSong = null; this.resumeAfter = null; this.seqCursor = null; }   // a fresh switch starts at the top
+    this.refresh();
+    this.rebuildQueue();
+    this.savePlaylistState();
+    const first = this.order === 'sequential' && this.queue.length ? `, starting with ${path.basename(this.queue[0], path.extname(this.queue[0]))}` : '';
+    return `playlist: ${names.join(', ')} (${this.songPool.length} songs, ${this.order}${first})`;
+  }
+
+  resetPlaylist() {
+    clearPlaylistState();
+    this.active = parsePlaylistSpec(CONFIG.playlist);
+    this.order = CONFIG.playlistOrder;
+    this.restoredPlaylist = false;
     this.warnedMissing = false;
     this.refresh();
     this.rebuildQueue();
-    return `playlist: ${names.join(', ')} (${this.songPool.length} songs)`;
+    return `playlist: back to the .env default — ${this.active.join(', ')} (${this.songPool.length} songs, ${this.order})`;
   }
 
   playlistInfo() {
     this.playlists = this.scanPlaylists();
     const available = {};
     for (const [name, files] of this.playlists) available[name] = files.length;
-    return { active: this.active, available };
+    return { active: this.active, order: this.order, available };
   }
 
   // Rescan the folders. Cheap (a few readdirs), so it runs before every playout block:
@@ -371,9 +429,12 @@ class RadioScheduler {
     this.warnedHourly = true;
 
     const pool = new Set(this.songPool);
+    const added = this.songPool.filter(f => !known.has(f));
     this.queue = this.queue.filter(f => pool.has(f));
-    for (const f of this.songPool) {
-      if (!known.has(f)) this.queue.splice(Math.floor(Math.random() * (this.queue.length + 1)), 0, f);
+    if (this.order === 'sequential') {
+      this.queue = this.sequenceFrom(this.seqCursor);    // derived from the cursor; nothing to merge
+    } else {
+      for (const f of added) this.queue.splice(Math.floor(Math.random() * (this.queue.length + 1)), 0, f);
     }
 
     const after = { songs: this.songPool.length, bumpers: this.genericBumpers.length, intros: this.songIntroMap.size };
@@ -382,12 +443,49 @@ class RadioScheduler {
     this.scannedOnce = true;
   }
 
+  sortedPool() {
+    const rel = f => path.relative(CONFIG.songsDir, f);
+    return [...this.songPool].sort((a, b) => naturalOrder.compare(rel(a), rel(b)));
+  }
+
   rebuildQueue() {
+    if (this.order === 'sequential') {
+      this.seqCursor = this.seqCursor || this.resumeAfter;
+      this.queue = this.sequenceFrom(this.seqCursor);
+      return;
+    }
     const shuffled = shuffle(this.songPool);
     if (shuffled.length > 1 && this.lastSong && shuffled[0] === this.lastSong) {
       shuffled.push(shuffled.shift());
     }
     this.queue = shuffled;
+  }
+
+  // The song after `cursor` in natural order, wrapping at the end. Resolved by name, so a
+  // file added or deleted mid-cycle neither skips nor repeats anything.
+  nextAfter(cursor) {
+    const sorted = this.sortedPool();
+    if (!sorted.length) return null;
+    if (!cursor) return sorted[0];
+    const idx = sorted.indexOf(cursor);
+    if (idx >= 0) return sorted[(idx + 1) % sorted.length];
+    const rel = f => path.relative(CONFIG.songsDir, f);
+    return sorted.find(f => naturalOrder.compare(rel(f), rel(cursor)) > 0) || sorted[0];
+  }
+
+  // Sorted pool rotated to continue after `afterFile`; the visible upcoming list.
+  sequenceFrom(afterFile) {
+    const sorted = this.sortedPool();
+    if (!sorted.length || !afterFile) return sorted;
+    const rel = f => path.relative(CONFIG.songsDir, f);
+    let cut = sorted.indexOf(afterFile);
+    if (cut >= 0) {
+      cut += 1;
+    } else {
+      cut = sorted.findIndex(f => naturalOrder.compare(rel(f), rel(afterFile)) > 0);
+      if (cut < 0) cut = sorted.length;   // it sorted last: wrap to the top
+    }
+    return [...sorted.slice(cut), ...sorted.slice(0, cut)];
   }
 
   findMatchingIntro(songPath) {
@@ -405,7 +503,14 @@ class RadioScheduler {
   getNextSong() {
     this.refresh();
     if (!this.queue.length) this.rebuildQueue();
-    const next = this.queue.shift() || null;
+    let next;
+    if (this.order === 'sequential') {
+      next = this.nextAfter(this.seqCursor);
+      this.seqCursor = next;
+      this.queue = this.sequenceFrom(next);   // keep `upcoming` in step
+    } else {
+      next = this.queue.shift() || null;
+    }
     this.lastSong = next;
     return next;
   }
@@ -814,6 +919,7 @@ class Playout extends EventEmitter {
       this.current.startedAt = new Date().toISOString();
       this.fill(); // kick decoding for the following item
       const cur = this.current;
+      if (cur.kind === 'song') this.scheduler.noteSongPlaying(cur.file);
       cur.ready.then(() => logInfo(`${COLORS.magenta}▶ ${cur.kind}${COLORS.reset} ${cur.displayTitle}${CONFIG.normalize && cur.loudness ? ` (${cur.loudness.i.toFixed(1)} LUFS, gain ${cur.gainDb >= 0 ? '+' : ''}${cur.gainDb.toFixed(1)} dB)` : ''}`));
       this.emit('track', this.current);
     } else {
@@ -979,8 +1085,8 @@ class Playout extends EventEmitter {
 
   // Switch playlist. Queued items from the old playlist are dropped; the current song
   // finishes unless `now` is set.
-  setPlaylist(spec, now = false) {
-    const msg = this.scheduler.setPlaylist(spec);
+  setPlaylist(spec, { now = false, order = null, reset = false } = {}) {
+    const msg = reset ? this.scheduler.resetPlaylist() : this.scheduler.setPlaylist(spec, order);
     if (!msg.startsWith('playlist:')) return msg;
     for (const t of this.pending) t.destroy();
     this.pending = [];
@@ -1615,7 +1721,11 @@ function createServer(playout, broadcaster, importer) {
         return sendText(req, res, 200, playout.request(url.searchParams.get('q') || '', url.searchParams.get('now') === '1'));
       }
       if (p === '/playlist') {
-        return sendText(req, res, 200, playout.setPlaylist(url.searchParams.get('name') || '', url.searchParams.get('now') === '1'));
+        return sendText(req, res, 200, playout.setPlaylist(url.searchParams.get('name') || '', {
+          now: url.searchParams.get('now') === '1',
+          order: parseOrderWord(url.searchParams.get('order') || ''),
+          reset: url.searchParams.get('reset') === '1',
+        }));
       }
       if (p === '/seek') {
         const to = url.searchParams.get('to');
@@ -1700,7 +1810,7 @@ async function main() {
   server.listen(CONFIG.port, CONFIG.host, () => {
     console.log(`${COLORS.green}Live radio running at http://localhost:${CONFIG.port}${CONFIG.mount}${COLORS.reset}`);
     console.log(`${COLORS.cyan}Songs dir:    ${CONFIG.songsDir} (${scheduler.songPool.length} songs)${COLORS.reset}`);
-    console.log(`${COLORS.cyan}Playlist:     ${scheduler.active.join(', ')} — available: ${Object.entries(scheduler.playlistInfo().available).map(([n, c]) => `${n} (${c})`).join(', ')}${COLORS.reset}`);
+    console.log(`${COLORS.cyan}Playlist:     ${scheduler.active.join(', ')} (${scheduler.order}${scheduler.restoredPlaylist ? ', restored' : ''}) — available: ${Object.entries(scheduler.playlistInfo().available).map(([n, c]) => `${n} (${c})`).join(', ')}${COLORS.reset}`);
     console.log(`${COLORS.cyan}Song intros:  ${CONFIG.songIntrosDir} (${scheduler.songIntroMap.size})${COLORS.reset}`);
     console.log(`${COLORS.cyan}Bumpers:      ${CONFIG.genericBumpersDir} (${scheduler.genericBumpers.length}, every ${CONFIG.bumperEvery} song(s))${COLORS.reset}`);
     console.log(`${COLORS.cyan}Encoder:      mp3 ${CONFIG.bitrate}k ${CONFIG.sampleRate}Hz, burst ${CONFIG.burstSeconds}s, normalize=${CONFIG.normalize ? 'on' : 'off'}${CONFIG.hls ? `, HLS at /hls/live.m3u8` : ''}${COLORS.reset}`);
@@ -1734,9 +1844,32 @@ async function main() {
     },
     playlist: arg => {
       const parts = arg.trim().split(/\s+/).filter(Boolean);
-      if (!parts.length) { const i = scheduler.playlistInfo(); return `active: ${i.active.join(', ')} — available: ${Object.entries(i.available).map(([n, c]) => `${n} (${c})`).join(', ')}`; }
-      const now = parts[parts.length - 1].toLowerCase() === 'now';
-      return playout.setPlaylist(parts[0], now);
+      if (!parts.length) {
+        const i = scheduler.playlistInfo();
+        return `active: ${i.active.join(', ')} (${i.order}) — available: ${Object.entries(i.available).map(([n, c]) => `${n} (${c})`).join(', ')}`;
+      }
+      if (parts[0].toLowerCase() === 'reset') return playout.setPlaylist('', { reset: true });
+
+      // Split the words into playlist name(s), an order, and "now". A playlist whose name
+      // happens to be "random" or "sequential" still wins over the keyword.
+      const known = scheduler.scanPlaylists();
+      let now = false;
+      let order = null;
+      const names = [];
+      for (const word of parts) {
+        const lower = word.toLowerCase();
+        if (known.has(lower)) { names.push(word); continue; }
+        if (lower === 'now') { now = true; continue; }
+        const asOrder = parseOrderWord(lower);
+        if (asOrder) { order = asOrder; continue; }
+        names.push(word);
+      }
+      const spec = names.join(' ');
+      if (!spec) {
+        if (!order) return 'usage: playlist <name> [sequential|random] [now] | playlist reset';
+        return playout.setPlaylist(scheduler.active.join(','), { now, order });  // order-only change
+      }
+      return playout.setPlaylist(spec, { now, order });
     },
     playlists: () => commands.playlist(''),
     bumper: arg => playout.queueBumper(arg.trim()),

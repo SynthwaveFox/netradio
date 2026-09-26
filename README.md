@@ -45,18 +45,32 @@ Every sub-folder of `songs/` is a playlist; files sitting directly in `songs/` a
 name, `all`, or a comma list like `retro,synth`). Switch at runtime with the console:
 
 ```
-playlists                 list playlists with song counts, show the active one
-playlist retro            switch after the current song finishes
-playlist retro now        switch immediately
-playlist retro,synth      play a merge of several
-playlist all              play everything
+playlists                    list playlists with song counts, show the active one and its order
+playlist halloween           switch after the current song finishes
+playlist halloween now       switch immediately
+playlist halloween sequential   play it in order instead of shuffled
+playlist sequential          change only the order, keep the playlist
+playlist retro,synth         play a merge of several
+playlist all                 play everything
+playlist reset               forget the saved choice, go back to .env
 ```
 
-or `POST /playlist?token=…&name=retro[&now=1]`. `/now.json` reports `playlist.active` and
-`playlist.available`. A switch reshuffles from the new pool and drops whatever was queued
-from the old one. Switches are not persisted: a restart goes back to `PLAYLIST` from `.env`.
-If the selected playlist does not exist or is empty, everything is played (with a warning)
-rather than going silent.
+or `POST /playlist?token=…&name=retro[&now=1][&order=sequential][&reset=1]`. `/now.json`
+reports `playlist.active`, `playlist.order` and `playlist.available`. A switch drops whatever
+was queued from the old playlist. If the selected playlist does not exist or is empty,
+everything is played (with a warning) rather than going silent.
+
+**The choice persists across restarts** — playlist and order are saved to
+`playlist-state.json`, and the startup banner shows `(sequential, restored)`. `PLAYLIST` /
+`PLAYLIST_ORDER` in `.env` are only the defaults before anything has been chosen;
+`playlist reset` deletes the saved state and returns to them.
+
+**Order.** `random` (the default) reshuffles the pool each cycle. `sequential` plays in
+natural filename order — `track2` before `track10`, subfolders grouped — then loops. A
+sequential run also remembers its position, so a restart continues with the next song
+rather than starting the playlist over. Files added or removed mid-run slot into the right
+place without skipping or repeating anything; switching playlists (or re-issuing
+`playlist <name> sequential`) starts a run from the top.
 
 ### Importing playlists (Spotify / YouTube) — optional
 
@@ -186,7 +200,7 @@ Console commands (type into the Pterodactyl console or the terminal):
 | `seek +30` / `seek -10` | jump forward / back within the current track |
 | `seek 90` / `seek 1:30` | jump to an absolute position |
 | `now` | current track, position, next up, listener count |
-| `playlists` / `playlist <name> [now]` | list / switch playlists (see Playlists) |
+| `playlists` / `playlist <name> [sequential\|random] [now]` / `playlist reset` | list / switch playlists and play order (see Playlists) |
 | `import <url> [folder] [max]` / `imports` / `spotify` / `ytdlp` | import a Spotify/YouTube playlist into `songs/<folder>` (see Importing) |
 | `intros` | song-intro coverage report + `missing-intros.txt` |
 | `hourly` / `hourly play [hour]` | time-check coverage and station time / force one at the next break to test |
@@ -212,7 +226,8 @@ treat it as a proper Icecast mount.
 | `SONGS_DIR`, `SONG_INTROS_DIR`, `GENERIC_BUMPERS_DIR` | see above | |
 | `BITRATE` | `192` | MP3 kbps (CBR) |
 | `BUMPER_EVERY` | `1` | generic bumper before every Nth song; `0` = never (song-specific intros always play) |
-| `PLAYLIST` | `default` | playlist folder(s) to start with: a name, `all`, or `a,b` |
+| `PLAYLIST` | `default` | playlist folder(s) to start with: a name, `all`, or `a,b`. Only used until a `playlist` command saves a choice |
+| `PLAYLIST_ORDER` | `random` | `random` or `sequential`; likewise only the pre-choice default |
 | `NORMALIZE` | `1` | loudness alignment per track: each file's integrated loudness is measured once (cached in `loudness-cache.json`) and ONE fixed gain is applied for the whole track. No compression or gain riding — dynamics within a song are untouched. `0` to disable |
 | `NORMALIZE=peak` | | alternative: align every track's true peak to `NORMALIZE_PEAK` instead of its loudness. Simpler, but a dynamic voice clip and a compressed song at the same peak differ a lot in perceived volume |
 | `NORMALIZE_TARGET` | `-16` | target LUFS (loudness mode) |
