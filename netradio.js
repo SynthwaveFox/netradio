@@ -109,6 +109,7 @@ const CONFIG = {
   hlsDir: process.env.HLS_DIR || path.join(__dirname, 'hls'),
   hlsBitrate: Number(process.env.HLS_BITRATE || 128),
   hlsSegmentSeconds: Number(process.env.HLS_SEGMENT_SECONDS || 4),
+  hlsListenerTimeout: Number(process.env.HLS_LISTENER_TIMEOUT || 30), // seconds of silence before an HLS client is counted as gone
   hlsWindowSegments: Number(process.env.HLS_WINDOW_SEGMENTS || 6),  // playlist length. Players start at its FIRST segment, so this is the tune-in delay
   hlsKeepSegments: Number(process.env.HLS_KEEP_SEGMENTS || 15),     // extra expired segments kept on disk for players that fell behind
 
@@ -1591,7 +1592,50 @@ function serveStream(req, res, broadcaster) {
   });
 }
 
-function serveHls(req, res, urlPath) {
+// HLS has no persistent connection, so "listeners" are clients that fetched a segment or
+// re-polled the playlist recently. Behind a reverse proxy every request shares the proxy's
+// IP, so the client key uses X-Forwarded-For / X-Real-IP when present and falls back to
+// the socket address plus user-agent (which at least separates AVPro from browsers).
+class HlsAudience {
+  constructor() {
+    this.clients = new Map();   // key -> { last, ip, ua, hits }
+    this.peak = 0;
+  }
+
+  static clientIp(req) {
+    const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    return fwd || req.headers['x-real-ip'] || (req.socket ? req.socket.remoteAddress : '?') || '?';
+  }
+
+  note(req) {
+    const ip = HlsAudience.clientIp(req);
+    const ua = String(req.headers['user-agent'] || 'unknown').slice(0, 80);
+    const key = `${ip}|${ua}`;
+    const entry = this.clients.get(key) || { ip, ua, hits: 0, since: Date.now() };
+    entry.last = Date.now();
+    entry.hits += 1;
+    this.clients.set(key, entry);
+    this.prune();
+    this.peak = Math.max(this.peak, this.clients.size);
+  }
+
+  prune() {
+    const cutoff = Date.now() - CONFIG.hlsListenerTimeout * 1000;
+    for (const [key, e] of this.clients) if (e.last < cutoff) this.clients.delete(key);
+  }
+
+  get size() {
+    this.prune();
+    return this.clients.size;
+  }
+
+  list() {
+    this.prune();
+    return [...this.clients.values()].map(e => `${e.ip} ${e.ua.split(/[ /]/)[0]} (${Math.round((Date.now() - e.since) / 1000)}s, ${e.hits} reqs)`);
+  }
+}
+
+function serveHls(req, res, urlPath, hlsAudience) {
   const rel = urlPath.slice('/hls/'.length);
   const abs = path.resolve(CONFIG.hlsDir, rel);
   if (!abs.startsWith(path.resolve(CONFIG.hlsDir)) || rel.includes('..')) return sendText(req, res, 400, 'Bad path');
@@ -1605,6 +1649,7 @@ function serveHls(req, res, urlPath) {
       'Access-Control-Allow-Origin': '*',
     });
     if (req.method === 'HEAD') return res.end();
+    if (hlsAudience) hlsAudience.note(req);
     fs.createReadStream(abs).on('error', () => res.destroy()).pipe(res);
     logReq(req, 200);
   });
@@ -1655,7 +1700,7 @@ function authorized(url) {
   return CONFIG.adminToken && url.searchParams.get('token') === CONFIG.adminToken;
 }
 
-function createServer(playout, broadcaster, importer) {
+function createServer(playout, broadcaster, importer, hlsAudience) {
   const server = http.createServer((req, res) => {
     let url;
     try {
@@ -1682,8 +1727,10 @@ function createServer(playout, broadcaster, importer) {
     if (p === '/now.json' || p === '/status.json') {
       return sendJson(req, res, 200, {
         ...playout.status(),
-        listeners: broadcaster.listeners.size,
-        peakListeners: broadcaster.peakListeners,
+        listeners: broadcaster.listeners.size + hlsAudience.size,
+        listenersMp3: broadcaster.listeners.size,
+        listenersHls: hlsAudience.size,
+        peakListeners: Math.max(broadcaster.peakListeners, hlsAudience.peak),
         stream: { url: streamUrl(req), format: 'mp3', bitrate: CONFIG.bitrate, sampleRate: CONFIG.sampleRate, hls: CONFIG.hls ? `${streamUrl(req).replace(CONFIG.mount, '')}/hls/live.m3u8` : null },
         encoderRestarts: playout.encoder.restarts,
         import: importer ? importer.status() : null,
@@ -1702,7 +1749,7 @@ function createServer(playout, broadcaster, importer) {
       return logReq(req, 200);
     }
 
-    if (CONFIG.hls && p.startsWith('/hls/')) return serveHls(req, res, p);
+    if (CONFIG.hls && p.startsWith('/hls/')) return serveHls(req, res, p, hlsAudience);
 
     if (importer && p.startsWith('/spotify/')) {
       importer.handleHttp(req, res, url, sendText, authorized).then(handled => { if (!handled) sendText(req, res, 404, '404 Not found'); });
@@ -1796,9 +1843,10 @@ async function main() {
   const encoder = new Encoder();
   const playout = new Playout(scheduler, encoder);
   const broadcaster = new Broadcaster(playout);
+  const hlsAudience = new HlsAudience();
   encoder.on('data', chunk => broadcaster.onEncoded(chunk));
 
-  const server = createServer(playout, broadcaster, importer);
+  const server = createServer(playout, broadcaster, importer, hlsAudience);
   server.on('error', err => {
     logErr(`http server error: ${err.message}`);
     process.exit(1);
@@ -1893,7 +1941,15 @@ async function main() {
       const pos = n ? `${Math.floor(n.position)}s${n.duration ? ` / ${Math.floor(n.duration)}s` : ''}` : '';
       return `${n ? `[${n.kind}] ${n.display} (${pos})` : '(silence)'} | next: ${s.next ? s.next.display : '-'} | listeners: ${broadcaster.listeners.size}`;
     },
-    listeners: () => [...broadcaster.listeners].map(l => `${l.remote} (${Math.round((Date.now() - l.connectedAt) / 1000)}s)`).join(', ') || 'none',
+    listeners: () => {
+      const mp3 = [...broadcaster.listeners].map(l => `${l.remote} (${Math.round((Date.now() - l.connectedAt) / 1000)}s)`);
+      const hls = hlsAudience.list();
+      if (!mp3.length && !hls.length) return 'no listeners';
+      return [
+        `mp3 (${mp3.length}): ${mp3.join(', ') || 'none'}`,
+        `hls (${hls.length}, active within ${CONFIG.hlsListenerTimeout}s): ${hls.join(', ') || 'none'}`,
+      ].join(String.fromCharCode(10));
+    },
     queue: () => playout.status().upcoming.join('\n') || '(queue empty)',
     hourly: arg => {
       const parts = arg.trim().split(/\s+/).filter(Boolean);
