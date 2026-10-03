@@ -24,6 +24,7 @@ within a couple of seconds of each other (their own player buffer is the only di
 ```
 songs/            music library (mp3/flac/wav/m4a/aac/ogg/opus)
 songs/<name>/     a playlist named <name> (scanned recursively); loose files in songs/ = "default"
+songs/.../order.txt  optional play order for sequential mode (written by `import`, editable)
 intros/songs/     optional song-specific intros, named like the song: "artist-title.mp3"
 intros/generic/   generic bumpers, one is played before songs (see BUMPER_EVERY)
 intros/hourly/          top-of-hour time checks, one per hour: 0..23 or 1am..12pm
@@ -65,8 +66,15 @@ everything is played (with a warning) rather than going silent.
 `PLAYLIST_ORDER` in `.env` are only the defaults before anything has been chosen;
 `playlist reset` deletes the saved state and returns to them.
 
-**Order.** `random` (the default) reshuffles the pool each cycle. `sequential` plays in
-natural filename order — `track2` before `track10`, subfolders grouped — then loops. A
+**Order.** `random` (the default) reshuffles the pool each cycle. `sequential` follows the
+folder's `order.txt` if there is one, and otherwise natural filename order (`track2` before
+`track10`), then loops.
+
+`order.txt` is written by `import`, listing the source playlist's own order — so a Spotify
+playlist plays in *your* order rather than alphabetically. It is a plain list of file names,
+one per line, `#` for comments, and you can edit or write it by hand; files not listed play
+after the listed ones in name order. Re-running an import rewrites it. The `playlist` status
+line tells you which is in force (`12/55 from order.txt`, or `no order.txt, so name order`). A
 sequential run also remembers its position, so a restart continues with the next song
 rather than starting the playlist over. Files added or removed mid-run slot into the right
 place without skipping or repeating anything; switching playlists (or re-issuing
@@ -86,7 +94,8 @@ ytdlp                                     update yt-dlp
 `import https://open.spotify.com/playlist/... retro` reads the playlist, looks each track up
 on YouTube Music (the audio-only "songs" results), verifies title and duration (±12 s),
 downloads it with yt-dlp as 192k mp3 tagged with the playlist's artist/title, and drops it
-into `songs/retro/` — where it is live immediately. Tracks already in the folder are skipped,
+into `songs/retro/` — where it is live immediately. It also writes `songs/retro/order.txt`
+with the playlist's own running order, which `playlist retro sequential` then follows. Tracks already in the folder are skipped,
 so re-running an import after you add songs to the Spotify playlist only fetches the new
 ones. Tracks with no confident match are listed in `songs/<folder>/import-misses.txt` rather
 than guessed. YouTube / YouTube Music playlist URLs work too (no matching needed). Same over
@@ -184,6 +193,7 @@ Then:
 | `http://host:3722/radio.mp3` | live MP3 stream (Icecast-style) for browsers, VLC, foobar, etc. |
 | `http://host:3722/` | tiny web player / now-playing page |
 | `http://host:3722/now.json` | current track, position, duration, next up, listener count |
+| `http://host:3722/now.txt` | the same as flat `key=value` lines, for VRChat/Udon (see below) |
 | `http://host:3722/history.json` | last 50 tracks |
 | `POST /skip?token=…` | skip current track (needs `ADMIN_TOKEN`) |
 | `POST /play?token=…&q=fireflies[&now=1]` | queue / play a specific song |
@@ -286,6 +296,41 @@ $env:STATION_NAME="Fennia FM"; $env:ADMIN_TOKEN="changeme"; $env:HLS="1"; node n
    song. Compare against `/now.json` if in doubt.
 4. Once it works, put it behind the same domain/TLS as the CDN so Quest users (https only)
    can tune in, then set `PUBLIC_URL` accordingly.
+
+## Now playing in the world (Udon)
+
+`GET /now.txt` returns flat `key=value` lines — `station`, `kind`, `artist`, `title`,
+`display`, `position`, `duration`, `next`, `listeners`, `delay`, `serverTime` — which Udon
+can parse without a JSON step. `udon/StarlightNowPlaying.cs` is a ready UdonSharp script:
+drop it on a GameObject, set the URL, assign TextMeshPro fields.
+
+**Use `?delay=hls`.** An HLS listener hears the stream about `HLS_WINDOW_SEGMENTS ×
+HLS_SEGMENT_SECONDS` seconds (~24 s) behind the server's playhead, so the plain endpoint
+would change the on-screen title before anyone hears it. `?delay=hls` reports what a
+listener is hearing right now, reconstructed from the play history; `?delay=12` sets an
+explicit number of seconds. The same parameter works on `/now.json`.
+
+How far behind a client actually is depends on the player: AVPro starts at the first segment
+of the playlist (~24 s, what `delay=hls` returns), while hls.js in a browser sits ~13 s back.
+The built-in web page therefore does not use `delay=hls` — it measures its own lag from the
+stream's `EXT-X-PROGRAM-DATE-TIME` (`hls.playingDate` vs the response's `serverTime`) and
+asks for exactly that many seconds, falling back to 3 segments if the player does not expose
+it. If you build another client, either measure the same way or pick a fixed `delay=` that
+matches it.
+
+`next` is always the next **song** — bumpers, station IDs and time checks are skipped, so the
+display never reads "up next: bumper14".
+
+Long titles: the "…" cut-off is TextMeshPro's Ellipsis overflow mode, so set that component's
+Overflow to Overflow (or enable Auto Size), or use the separate `artistText` / `titleText`
+fields on two lines. The script also has an optional marquee (`scrollLongTitles`, off by
+default) if you would rather scroll than wrap.
+
+Limits that shape the script: VRChat allows **one string download every 5 seconds** per
+world, so poll every 10 s and interpolate the position locally between polls (the script
+does). String loading is also subject to VRChat's trusted-URL list — only Disbridge,
+`*.github.io`, gist, pastebin and `*.vrcdn.cloud` are trusted — so for your own domain
+viewers need **Allow Untrusted URLs**, which the stream audio already requires anyway.
 
 ## VRChat notes
 

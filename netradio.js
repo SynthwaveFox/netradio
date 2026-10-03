@@ -174,10 +174,13 @@ function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
+// Dot-prefixed names are skipped: that is what in-progress downloads and processing
+// temporaries are called, and a half-written file must never reach the air.
 function getAudioFilesRecursive(dir) {
   if (!fs.existsSync(dir)) return [];
   const files = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith('.')) continue;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) files.push(...getAudioFilesRecursive(full));
     else if (entry.isFile() && AUDIO_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) files.push(full);
@@ -287,6 +290,33 @@ function clearPlaylistState() {
 // "track2" before "track10", folders grouped
 const naturalOrder = new Intl.Collator('en', { numeric: true, sensitivity: 'base' });
 
+// A playlist folder may carry an order.txt: one file name per line, in the order they should
+// play (what `import` writes from the Spotify playlist, and editable by hand). Sequential
+// playback follows it; anything not listed plays after, in natural name order.
+const ORDER_FILE = 'order.txt';
+const orderFileCache = new Map();   // dir -> { mtime, size, names: [normalized] }
+
+function readOrderFile(dir) {
+  const file = path.join(dir, ORDER_FILE);
+  let st;
+  try { st = fs.statSync(file); } catch { orderFileCache.delete(dir); return null; }
+  const hit = orderFileCache.get(dir);
+  if (hit && hit.mtime === st.mtimeMs && hit.size === st.size) return hit.names;
+  let names = [];
+  try {
+    names = fs.readFileSync(file, 'utf8')
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(l => l && !l.startsWith('#'))
+      .map(l => normalizeName(path.basename(l, path.extname(l))));
+  } catch (e) {
+    logWarn(`could not read ${path.join(path.basename(dir), ORDER_FILE)}: ${e.message}`);
+    return null;
+  }
+  orderFileCache.set(dir, { mtime: st.mtimeMs, size: st.size, names });
+  return names;
+}
+
 function parseOrderWord(word) {
   const w = String(word).toLowerCase();
   if (['sequential', 'seq', 'ordered', 'order', 'inorder'].includes(w)) return 'sequential';
@@ -377,7 +407,12 @@ class RadioScheduler {
     this.refresh();
     this.rebuildQueue();
     this.savePlaylistState();
-    const first = this.order === 'sequential' && this.queue.length ? `, starting with ${path.basename(this.queue[0], path.extname(this.queue[0]))}` : '';
+    let first = '';
+    if (this.order === 'sequential' && this.queue.length) {
+      const ordered = this.orderedCount();
+      first = `, starting with ${path.basename(this.queue[0], path.extname(this.queue[0]))}`
+        + (ordered ? `; ${ordered}/${this.songPool.length} from ${ORDER_FILE}` : `; no ${ORDER_FILE}, so name order`);
+    }
     return `playlist: ${names.join(', ')} (${this.songPool.length} songs, ${this.order}${first})`;
   }
 
@@ -444,9 +479,32 @@ class RadioScheduler {
     this.scannedOnce = true;
   }
 
+  // Sequential play order: a folder's order.txt first (Spotify order from `import`), then
+  // anything unlisted in natural name order. Files keep their own folder's ordering.
   sortedPool() {
     const rel = f => path.relative(CONFIG.songsDir, f);
-    return [...this.songPool].sort((a, b) => naturalOrder.compare(rel(a), rel(b)));
+    const rank = new Map();
+    for (const f of this.songPool) {
+      const names = readOrderFile(path.dirname(f));
+      const i = names ? names.indexOf(normalizeName(path.basename(f, path.extname(f)))) : -1;
+      rank.set(f, i < 0 ? Infinity : i);
+    }
+    return [...this.songPool].sort((a, b) => {
+      const ra = rank.get(a);
+      const rb = rank.get(b);
+      if (ra !== rb) return ra - rb;
+      return naturalOrder.compare(rel(a), rel(b));
+    });
+  }
+
+  // How many of the active songs have a place in an order.txt (for status output).
+  orderedCount() {
+    let n = 0;
+    for (const f of this.songPool) {
+      const names = readOrderFile(path.dirname(f));
+      if (names && names.includes(normalizeName(path.basename(f, path.extname(f))))) n += 1;
+    }
+    return n;
   }
 
   rebuildQueue() {
@@ -1112,8 +1170,78 @@ class Playout extends EventEmitter {
     return next ? `${CONFIG.name} — up next: ${next.displayTitle}` : CONFIG.name;
   }
 
-  status() {
+  // What a listener who is `delay` seconds behind the playhead is hearing right now,
+  // reconstructed from the current track and the history. Returns null if unknown.
+  playingAgo(delay) {
+    if (!(delay > 0)) return this.current ? this.current.toJSON() : null;
+    const cur = this.current;
+    if (cur) {
+      const pos = cur.position / PCM_BPS;
+      if (pos >= delay) return { ...cur.toJSON(), position: pos - delay };
+    }
+    const target = Date.now() - delay * 1000;
+    for (const h of this.history) {
+      const endedMs = Date.parse(h.endedAt);
+      const startedMs = endedMs - (h.position || 0) * 1000;
+      if (target >= startedMs && target < endedMs) {
+        return { ...h, position: (target - startedMs) / 1000 };
+      }
+    }
+    return cur ? cur.toJSON() : null;   // history does not reach back that far
+  }
+
+  // The track after the one a delayed listener is hearing.
+  // The next *song* after what the delayed listener is hearing — bumpers, intros and time
+  // checks are skipped, so a UI never shows "up next: bumper14".
+  nextAfterAgo(delay, nowItem) {
+    const fromPending = () => {
+      const nextSong = this.pending.find(t => t.kind === 'song');
+      return nextSong ? { kind: nextSong.kind, display: nextSong.displayTitle, file: path.basename(nextSong.file) } : null;
+    };
+    if (!(delay > 0) || !nowItem) return fromPending();
+
+    // history is newest-first, so items that come *after* nowItem are at lower indices.
+    const idx = this.history.findIndex(h => h.file === nowItem.file && h.endedAt === nowItem.endedAt);
+    if (idx >= 0) {
+      for (let i = idx - 1; i >= 0; i -= 1) {
+        const h = this.history[i];
+        if (h.kind === 'song') return { kind: h.kind, display: h.display, file: h.file };
+      }
+    }
+    if (this.current && this.current.kind === 'song' && (idx >= 0 || !nowItem.endedAt)) {
+      if (path.basename(this.current.file) !== nowItem.file) {
+        return { kind: this.current.kind, display: this.current.displayTitle, file: path.basename(this.current.file) };
+      }
+    }
+    return fromPending();
+  }
+
+  // Seconds an HLS listener trails the playhead (playlist window + one segment of buffer).
+  hlsDelaySeconds() {
+    return CONFIG.hls ? CONFIG.hlsWindowSegments * CONFIG.hlsSegmentSeconds : 0;
+  }
+
+  status(delay = 0) {
     const nextSong = this.pending.find(t => t.kind === 'song');
+    if (delay > 0) {
+      const nowItem = this.playingAgo(delay);
+      return {
+        station: { name: CONFIG.name, description: CONFIG.description, genre: CONFIG.genre },
+        live: true,
+        delay,
+        now: nowItem,
+        next: this.nextAfterAgo(delay, nowItem),
+        playlist: this.scheduler.playlistInfo(),
+        upcoming: [
+          ...(this.current && (!nowItem || nowItem.file !== path.basename(this.current.file)) ? [this.current.displayTitle] : []),
+          ...this.pending.filter(t => t.kind === 'song').map(t => t.displayTitle),
+        ].slice(0, 5),
+        serverTime: new Date().toISOString(),
+        uptime: Math.round((Date.now() - this.startedAt.getTime()) / 1000),
+        underruns: this.underruns,
+        stalls: this.stalls,
+      };
+    }
     return {
       station: { name: CONFIG.name, description: CONFIG.description, genre: CONFIG.genre },
       live: true,
@@ -1534,6 +1662,36 @@ function sendJson(req, res, status, body) {
   logReq(req, status);
 }
 
+// ?delay=24 (seconds) or ?delay=hls to see what an HLS listener is hearing right now.
+function requestedDelay(url, playout) {
+  const raw = (url.searchParams.get('delay') || '').trim().toLowerCase();
+  if (!raw) return 0;
+  if (raw === 'hls' || raw === 'auto') return playout.hlsDelaySeconds();
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.min(n, 600) : 0;
+}
+
+// Flat key=value lines: what Udon (VRCStringDownloader) can parse without a JSON step.
+function nowPlayingText(playout, broadcaster, hlsAudience, delay) {
+  const st = playout.status(delay);
+  const n = st.now;
+  const lines = [
+    `station=${CONFIG.name}`,
+    `kind=${n ? n.kind : 'none'}`,
+    `artist=${n ? n.artist || '' : ''}`,
+    `title=${n ? n.title || '' : ''}`,
+    `display=${n ? n.display || '' : ''}`,
+    `position=${n ? (n.position || 0).toFixed(1) : '0.0'}`,
+    `duration=${n && n.duration ? n.duration.toFixed(1) : '0.0'}`,
+    `next=${st.next ? st.next.display : ''}`,
+    `listeners=${broadcaster.listeners.size + hlsAudience.size}`,
+    `delay=${delay}`,
+    `serverTime=${Math.round(Date.now() / 1000)}`,
+  ];
+  // Values must not contain newlines, or the line format breaks.
+  return lines.map(l => l.replace(/[\r\n]+/g, ' ')).join(String.fromCharCode(10)) + String.fromCharCode(10);
+}
+
 function sendText(req, res, status, text) {
   res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
   res.end(text);
@@ -1677,12 +1835,21 @@ function pageHtml(req) {
 </main>
 ${CONFIG.hls ? '<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.15/hls.min.js"></script>' : ''}
 <script>
+// This page sits much closer to the live edge than AVPro does, so it measures its own lag
+// from the stream's PROGRAM-DATE-TIME rather than assuming the AVPro figure.
+var hls=null, lag=${CONFIG.hls ? CONFIG.hlsSegmentSeconds * 3 : 0};
 ${CONFIG.hls ? `(function(){const a=document.getElementById('player');const src='/hls/live.m3u8';
-if(a.canPlayType('application/vnd.apple.mpegurl')){a.src=src;}
-else if(window.Hls&&Hls.isSupported()){const h=new Hls({liveSyncDurationCount:3,backBufferLength:30});h.loadSource(src);h.attachMedia(a);}
-else{a.src='${CONFIG.mount}';}})();` : ''}
+if(window.Hls&&Hls.isSupported()){hls=new Hls({liveSyncDurationCount:3,backBufferLength:30});hls.loadSource(src);hls.attachMedia(a);}
+else if(a.canPlayType('application/vnd.apple.mpegurl')){a.src=src;}
+else{a.src='${CONFIG.mount}';lag=0;}})();` : ''}
 const fmt=s=>{s=Math.max(0,Math.floor(s));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
-async function poll(){try{const r=await fetch('/now.json',{cache:'no-store'});const j=await r.json();
+function measure(serverTime){try{
+  if(!hls||!hls.playingDate)return;
+  const d=(Date.parse(serverTime)-hls.playingDate.getTime())/1000;
+  if(isFinite(d)&&d>=0&&d<300)lag=d;
+}catch(e){}}
+async function poll(){try{const r=await fetch('/now.json?delay='+Math.max(0,Math.round(lag)),{cache:'no-store'});const j=await r.json();
+measure(j.serverTime);
 const n=j.now;document.getElementById('now').textContent=n?(n.kind==='song'?n.display:'['+n.kind+'] '+n.display):'(silence)';
 document.getElementById('time').textContent=n?fmt(n.position)+(n.duration?' / '+fmt(n.duration):''):'';
 document.getElementById('bar').style.width=n&&n.duration?Math.min(100,100*n.position/n.duration)+'%':'0';
@@ -1724,9 +1891,13 @@ function createServer(playout, broadcaster, importer, hlsAudience) {
       return serveStream(req, res, broadcaster);
     }
 
+    if (p === '/now.txt') {
+      return sendText(req, res, 200, nowPlayingText(playout, broadcaster, hlsAudience, requestedDelay(url, playout)));
+    }
+
     if (p === '/now.json' || p === '/status.json') {
       return sendJson(req, res, 200, {
-        ...playout.status(),
+        ...playout.status(requestedDelay(url, playout)),
         listeners: broadcaster.listeners.size + hlsAudience.size,
         listenersMp3: broadcaster.listeners.size,
         listenersHls: hlsAudience.size,
@@ -1834,7 +2005,7 @@ async function main() {
   let importer = null;
   try {
     const mod = await import('./importer.mjs');
-    importer = mod.createImporter({ CONFIG, __dirname, ensureDir, getAudioFilesRecursive, normalizeName, runFfmpeg, logInfo, logWarn, logErr, COLORS }, scheduler);
+    importer = mod.createImporter({ CONFIG, __dirname, ensureDir, getAudioFilesRecursive, normalizeName, runFfmpeg, logInfo, logWarn, logErr, COLORS, AUDIO_EXTENSIONS }, scheduler);
   } catch (e) {
     if (e.code !== 'ERR_MODULE_NOT_FOUND') logErr(`importer.mjs failed to load: ${e.message}`);
   }

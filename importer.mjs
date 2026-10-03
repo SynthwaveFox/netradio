@@ -9,10 +9,10 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 
 // Helpers handed over by netradio.js so this file has no copy of them.
-let CONFIG, __dirname, ensureDir, getAudioFilesRecursive, normalizeName, runFfmpeg, logInfo, logWarn, logErr, COLORS;
+let CONFIG, __dirname, ensureDir, getAudioFilesRecursive, normalizeName, runFfmpeg, logInfo, logWarn, logErr, COLORS, AUDIO_EXTENSIONS;
 
 export function createImporter(ctx, scheduler) {
-  ({ CONFIG, __dirname, ensureDir, getAudioFilesRecursive, normalizeName, runFfmpeg, logInfo, logWarn, logErr, COLORS } = ctx);
+  ({ CONFIG, __dirname, ensureDir, getAudioFilesRecursive, normalizeName, runFfmpeg, logInfo, logWarn, logErr, COLORS, AUDIO_EXTENSIONS } = ctx);
   return new Importer(scheduler);
 }
 
@@ -443,6 +443,40 @@ class Importer {
     return final;
   }
 
+  // Record the source playlist's own order so sequential playback can follow it instead of
+  // sorting by file name. One file name per line; the scheduler reads it as order.txt.
+  writeOrderFile(dir, tracks, sourceName, url) {
+    const byKey = new Map();
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (!e.isFile() || !AUDIO_EXTENSIONS.has(path.extname(e.name).toLowerCase())) continue;
+      const base = path.basename(e.name, path.extname(e.name));
+      byKey.set(looseTitle(base), base);
+    }
+    const lines = [];
+    const seen = new Set();
+    let unresolved = 0;
+    for (const t of tracks) {
+      const name = byKey.get(looseTitle(`${t.artist} - ${t.title}`)) || byKey.get(looseTitle(t.title));
+      if (!name) { unresolved += 1; continue; }
+      if (seen.has(name)) continue;
+      seen.add(name);
+      lines.push(name);
+    }
+    if (!lines.length) return;
+    const header = [
+      `# Play order for this folder, used when the playlist is sequential.`,
+      `# Written by: import ${url}`,
+      `# Source: ${sourceName} — ${new Date().toISOString()}`,
+      `# One file name per line. Edit freely; files not listed play afterwards in name order.`,
+      '',
+    ].join(String.fromCharCode(10));
+    const file = path.join(dir, 'order.txt');
+    fs.writeFileSync(file, header + lines.join(String.fromCharCode(10)) + String.fromCharCode(10));
+    logInfo(`order: wrote ${path.relative(__dirname, file)} with ${lines.length} tracks in playlist order${unresolved ? ` (${unresolved} not on disk yet)` : ''}`);
+  }
+
   async runJob(job) {
     logInfo(`import: reading ${job.url}`);
     await this.ytdlp.locate(); // fail the whole job with a clear message if yt-dlp cannot run
@@ -481,6 +515,7 @@ class Importer {
     }
     logInfo(`import done: ${this.current.ok} downloaded, ${this.current.skipped} already there, ${this.current.failed} missed` +
       (this.current.ok && !this.scheduler.active.includes(folder) && !this.scheduler.active.includes('all') ? ` — switch with: playlist ${folder}` : ''));
+    this.writeOrderFile(dir, src.tracks, src.name, job.url);
     if (misses.length) {
       const report = path.join(dir, 'import-misses.txt');
       fs.writeFileSync(report, `${new Date().toISOString()} ${job.url}\n${misses.join('\n')}\n`, { flag: 'a' });
