@@ -315,8 +315,19 @@ of the playlist (~24 s, what `delay=hls` returns), while hls.js in a browser sit
 The built-in web page therefore does not use `delay=hls` — it measures its own lag from the
 stream's `EXT-X-PROGRAM-DATE-TIME` (`hls.playingDate` vs the response's `serverTime`) and
 asks for exactly that many seconds, falling back to 3 segments if the player does not expose
-it. If you build another client, either measure the same way or pick a fixed `delay=` that
-matches it.
+it. The measured figure is shown on the page as `sync N.Ns behind live`.
+
+That measurement alone is not exact: ffmpeg anchors the first `PROGRAM-DATE-TIME` about one
+segment after the audio really entered the encoder, so `playingDate` reads late and the raw
+measurement comes out low by roughly `HLS_SEGMENT_SECONDS` — which showed up as the title
+changing before you heard the song. The page adds that one-segment correction automatically.
+Add `?trim=N` to the page URL to shift it further by N seconds (`/?trim=2` later,
+`/?trim=-2` earlier) if it still reads off by ear. If you build another
+client, either measure the same way or pick a fixed `delay=` that matches it.
+
+The page deliberately has no scrub bar: it is a live stream, so the player is reduced to
+play/pause and volume. A native `<audio controls>` offers a seek bar over the HLS window,
+which only breaks playback.
 
 `next` is always the next **song** — bumpers, station IDs and time checks are skipped, so the
 display never reads "up next: bumper14".

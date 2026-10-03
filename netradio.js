@@ -1823,14 +1823,24 @@ function pageHtml(req) {
   :root{color-scheme:dark}body{margin:0;font:15px/1.5 system-ui,sans-serif;background:#111318;color:#e6e6ea;display:grid;place-items:center;min-height:100vh}
   main{width:min(560px,92vw);padding:28px;border:1px solid #2a2d36;border-radius:14px;background:#171a21}
   h1{margin:0 0 4px;font-size:22px}.live{display:inline-block;background:#e0302f;color:#fff;font-size:11px;font-weight:700;letter-spacing:.1em;padding:2px 8px;border-radius:999px;vertical-align:middle;margin-left:8px}
-  .muted{color:#8a8f9c}.now{font-size:19px;margin:14px 0 2px}audio{width:100%;margin:18px 0 10px}code{background:#0d0f13;padding:2px 6px;border-radius:6px;font-size:13px}
+  .muted{color:#8a8f9c}.now{font-size:19px;margin:14px 0 2px}audio{display:none}code{background:#0d0f13;padding:2px 6px;border-radius:6px;font-size:13px}
+  .controls{display:flex;align-items:center;gap:12px;margin:18px 0 10px}
+  .controls button{width:44px;height:44px;border-radius:50%;border:1px solid #2a2d36;background:#20242e;color:#e6e6ea;font-size:16px;cursor:pointer;line-height:1}
+  .controls button:hover{background:#262b36}
+  .controls input[type=range]{flex:1;accent-color:#7aa2ff}
   .bar{height:4px;background:#2a2d36;border-radius:2px;overflow:hidden}.bar i{display:block;height:100%;width:0;background:#7aa2ff}
 </style></head><body><main>
 <h1>${escapeHtml(CONFIG.name)}<span class="live">LIVE</span></h1>
 <div class="muted">${escapeHtml(CONFIG.description)}</div>
 <div class="now" id="now">…</div><div class="muted" id="time"></div><div class="bar"><i id="bar"></i></div>
 <div class="muted" id="next" style="margin-top:8px"></div>
-<audio id="player" controls preload="none"${CONFIG.hls ? '' : ` src="${CONFIG.mount}"`}></audio>
+<audio id="player" preload="none"${CONFIG.hls ? '' : ` src="${CONFIG.mount}"`}></audio>
+<div class="controls">
+  <button id="playBtn" title="Play">&#9654;</button>
+  <span class="muted" id="state">paused</span>
+  <input id="vol" type="range" min="0" max="100" value="100" title="Volume">
+  <span class="muted" id="sync"></span>
+</div>
 <div class="muted">${CONFIG.hls ? `VRChat / HLS URL: <code>${escapeHtml(hlsUrl)}</code><br>` : ''}MP3 URL: <code>${escapeHtml(url)}</code> · <span id="listeners"></span></div>
 </main>
 ${CONFIG.hls ? '<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.15/hls.min.js"></script>' : ''}
@@ -1843,18 +1853,37 @@ if(window.Hls&&Hls.isSupported()){hls=new Hls({liveSyncDurationCount:3,backBuffe
 else if(a.canPlayType('application/vnd.apple.mpegurl')){a.src=src;}
 else{a.src='${CONFIG.mount}';lag=0;}})();` : ''}
 const fmt=s=>{s=Math.max(0,Math.floor(s));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
+// ?trim=N adds N seconds to the measured lag (the playlist's PROGRAM-DATE-TIME is anchored
+// about one segment late, and players differ), so the display can be dialled in live.
+const trim=Number(new URLSearchParams(location.search).get('trim')||0)||0;
+// ffmpeg anchors the first PROGRAM-DATE-TIME about one segment after that audio actually
+// entered the encoder, so playingDate reads late and the measured lag comes out low by
+// roughly one segment. Without this the title changes before you hear the song.
+const pdtCorrection=${CONFIG.hls ? CONFIG.hlsSegmentSeconds : 0};
+let measured=null;
 function measure(serverTime){try{
   if(!hls||!hls.playingDate)return;
   const d=(Date.parse(serverTime)-hls.playingDate.getTime())/1000;
-  if(isFinite(d)&&d>=0&&d<300)lag=d;
+  if(isFinite(d)&&d>=0&&d<300){measured=d;lag=d+pdtCorrection+trim;}
 }catch(e){}}
+
+const player=document.getElementById('player');
+const playBtn=document.getElementById('playBtn');
+const stateEl=document.getElementById('state');
+playBtn.onclick=()=>{if(player.paused){player.play();}else{player.pause();}};
+player.onplay=()=>{playBtn.innerHTML='&#10073;&#10073;';playBtn.title='Pause';stateEl.textContent='live';};
+player.onpause=()=>{playBtn.innerHTML='&#9654;';playBtn.title='Play';stateEl.textContent='paused';};
+const vol=document.getElementById('vol');
+vol.oninput=()=>{player.volume=vol.value/100;};
 async function poll(){try{const r=await fetch('/now.json?delay='+Math.max(0,Math.round(lag)),{cache:'no-store'});const j=await r.json();
 measure(j.serverTime);
 const n=j.now;document.getElementById('now').textContent=n?(n.kind==='song'?n.display:'['+n.kind+'] '+n.display):'(silence)';
 document.getElementById('time').textContent=n?fmt(n.position)+(n.duration?' / '+fmt(n.duration):''):'';
 document.getElementById('bar').style.width=n&&n.duration?Math.min(100,100*n.position/n.duration)+'%':'0';
 document.getElementById('next').textContent=j.next?'Up next: '+j.next.display:'';
-document.getElementById('listeners').textContent=j.listeners+' listening';}catch(e){}}
+document.getElementById('listeners').textContent=j.listeners+' listening';
+document.getElementById('sync').textContent=measured===null?'':('sync '+lag.toFixed(1)+'s behind live'+(trim?' (trim '+(trim>0?'+':'')+trim+')':''));
+}catch(e){}}
 poll();setInterval(poll,2000);
 </script></body></html>`;
 }
