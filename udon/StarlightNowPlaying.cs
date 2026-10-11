@@ -44,6 +44,7 @@ public class StarlightNowPlaying : UdonSharpBehaviour
     public TextMeshProUGUI nextText;       // "Up next: ..."
     public TextMeshProUGUI progressText;   // "1:24 / 3:48"
     public TextMeshProUGUI listenersText;  // "3 listening"
+    public TextMeshProUGUI playlistText;   // e.g. "Halloween Spooktacular"
     public Image progressBar;              // optional fill image (set Image Type = Filled)
 
     [Header("Text shown when a bumper or station ID is playing")]
@@ -103,6 +104,7 @@ public class StarlightNowPlaying : UdonSharpBehaviour
         string display = "";
         string next = "";
         string listeners = "";
+        string playlist = "";
         float position = 0f;
         float duration = 0f;
 
@@ -122,6 +124,7 @@ public class StarlightNowPlaying : UdonSharpBehaviour
             else if (key == "display") display = value;
             else if (key == "next") next = value;
             else if (key == "listeners") listeners = value;
+            else if (key == "playlist") playlist = value;
             else if (key == "position") float.TryParse(value, out position);
             else if (key == "duration") float.TryParse(value, out duration);
         }
@@ -139,6 +142,7 @@ public class StarlightNowPlaying : UdonSharpBehaviour
         SetText(titleText, isSong ? title : bumperLabel);
         SetText(nextText, next.Length > 0 ? "Up next: " + next : "");
         SetText(listenersText, listeners.Length > 0 ? listeners + " listening" : "");
+        SetText(playlistText, playlist);
         UpdateProgress();
     }
 

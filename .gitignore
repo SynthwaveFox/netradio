@@ -9,3 +9,5 @@ hourly-state.json
 spotify-auth.json
 bin/
 hls/
+
+exports/

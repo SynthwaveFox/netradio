@@ -114,6 +114,7 @@ const CONFIG = {
   hlsKeepSegments: Number(process.env.HLS_KEEP_SEGMENTS || 15),     // extra expired segments kept on disk for players that fell behind
 
   adminToken: process.env.ADMIN_TOKEN || '',
+  exportsDir: process.env.EXPORTS_DIR || path.join(__dirname, 'exports'), // archive renders (not part of the stream)
 
   // Raw bumper processing (see RawProcessor): intros/raw -> intros/generic
   rawIntrosDir: process.env.RAW_INTROS_DIR || path.join(__dirname, 'intros', 'raw'),
@@ -121,6 +122,34 @@ const CONFIG = {
   processEchoDelayMs: Number(process.env.PROCESS_ECHO_DELAY_MS || 10),   // Audacity Echo "delay time" 0.01 s
   processEchoDecay: Number(process.env.PROCESS_ECHO_DECAY || 0.5),      // Audacity Echo "decay factor"
   processPeakDb: Number(process.env.PROCESS_PEAK_DB || -1),             // peak-normalise target
+
+  // Broadcast voice chain applied to raw bumpers before the echo. Each stage can be turned
+  // off on its own; thresholds are in dB and converted to the linear values ffmpeg wants.
+  voiceChain: process.env.VOICE_CHAIN !== '0',
+  voiceInputTargetLufs: Number(process.env.VOICE_INPUT_TARGET_LUFS ?? -20), // level the raw take to this before the dynamics
+  voiceHpfHz: Number(process.env.VOICE_HPF_HZ ?? 100),                  // 0 = no high-pass
+  voiceExpander: process.env.VOICE_EXPANDER !== '0',
+  voiceExpThresholdDb: Number(process.env.VOICE_EXPANDER_THRESHOLD_DB ?? -32),
+  voiceExpRatio: Number(process.env.VOICE_EXPANDER_RATIO ?? 2),
+  voiceExpRangeDb: Number(process.env.VOICE_EXPANDER_RANGE_DB ?? -16),  // most it may duck by
+  voiceExpAttackMs: Number(process.env.VOICE_EXPANDER_ATTACK_MS ?? 5),
+  voiceExpReleaseMs: Number(process.env.VOICE_EXPANDER_RELEASE_MS ?? 180),
+  voiceDeess: process.env.VOICE_DEESS !== '0',
+  voiceDeessIntensity: Number(process.env.VOICE_DEESS_INTENSITY ?? 0.6),
+  voiceDeessMax: Number(process.env.VOICE_DEESS_MAX ?? 0.5),
+  voiceDeessFreq: Number(process.env.VOICE_DEESS_FREQ ?? 0.5),          // 0..1, higher = higher band
+  voiceEq: process.env.VOICE_EQ !== '0',
+  voiceEqHz: Number(process.env.VOICE_EQ_HZ ?? 3500),                   // presence / clarity
+  voiceEqGainDb: Number(process.env.VOICE_EQ_GAIN_DB ?? 4),
+  voiceEqQ: Number(process.env.VOICE_EQ_Q ?? 1),
+  voiceComp: process.env.VOICE_COMP !== '0',
+  voiceCompThresholdDb: Number(process.env.VOICE_COMP_THRESHOLD_DB ?? -24),
+  voiceCompRatio: Number(process.env.VOICE_COMP_RATIO ?? 3),
+  voiceCompAttackMs: Number(process.env.VOICE_COMP_ATTACK_MS ?? 8),
+  voiceCompReleaseMs: Number(process.env.VOICE_COMP_RELEASE_MS ?? 120),
+  voiceCompMakeupDb: Number(process.env.VOICE_COMP_MAKEUP_DB ?? 0),
+  voiceLimit: process.env.VOICE_LIMIT !== '0',
+  voiceLimitCeilingDb: Number(process.env.VOICE_LIMIT_CEILING_DB ?? -1),
 };
 
 const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.opus']);
@@ -293,6 +322,41 @@ const naturalOrder = new Intl.Collator('en', { numeric: true, sensitivity: 'base
 // A playlist folder may carry an order.txt: one file name per line, in the order they should
 // play (what `import` writes from the Spotify playlist, and editable by hand). Sequential
 // playback follows it; anything not listed plays after, in natural name order.
+// playlist-names.json maps a folder name to the name shown to listeners, e.g.
+//   { "default": "Starlight Rotation", "halloween": "Halloween Spooktacular" }
+// Missing entries fall back to the folder name, tidied up. Re-read when the file changes,
+// so renaming a playlist needs no restart.
+const PLAYLIST_NAMES_FILE = path.join(__dirname, 'playlist-names.json');
+let playlistNamesCache = { mtime: 0, size: -1, map: {} };
+
+function playlistNames() {
+  let st;
+  try { st = fs.statSync(PLAYLIST_NAMES_FILE); } catch { playlistNamesCache = { mtime: 0, size: -1, map: {} }; return {}; }
+  if (st.mtimeMs === playlistNamesCache.mtime && st.size === playlistNamesCache.size) return playlistNamesCache.map;
+  let map = {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(PLAYLIST_NAMES_FILE, 'utf8'));
+    for (const [k, v] of Object.entries(parsed)) if (typeof v === 'string') map[k.toLowerCase()] = v;
+  } catch (e) {
+    logWarn(`could not read playlist-names.json: ${e.message}`);
+    map = playlistNamesCache.map;
+  }
+  playlistNamesCache = { mtime: st.mtimeMs, size: st.size, map };
+  return map;
+}
+
+// "synthwave-80s" -> "Synthwave 80s"
+function prettyPlaylistName(name) {
+  const custom = playlistNames()[String(name).toLowerCase()];
+  if (custom) return custom;
+  if (name === 'all') return 'Everything';
+  return String(name)
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, c => c.toUpperCase());
+}
+
 const ORDER_FILE = 'order.txt';
 const orderFileCache = new Map();   // dir -> { mtime, size, names: [normalized] }
 
@@ -431,7 +495,15 @@ class RadioScheduler {
     this.playlists = this.scanPlaylists();
     const available = {};
     for (const [name, files] of this.playlists) available[name] = files.length;
-    return { active: this.active, order: this.order, available };
+    const names = {};
+    for (const name of this.playlists.keys()) names[name] = prettyPlaylistName(name);
+    return {
+      active: this.active,
+      display: this.active.map(prettyPlaylistName).join(' + '),
+      order: this.order,
+      available,
+      names,
+    };
   }
 
   // Rescan the folders. Cheap (a few readdirs), so it runs before every playout block:
@@ -981,7 +1053,8 @@ class Playout extends EventEmitter {
       if (cur.kind === 'song') this.scheduler.noteSongPlaying(cur.file);
       cur.ready.then(() => logInfo(`${COLORS.magenta}▶ ${cur.kind}${COLORS.reset} ${cur.displayTitle}${CONFIG.normalize && cur.loudness ? ` (${cur.loudness.i.toFixed(1)} LUFS, gain ${cur.gainDb >= 0 ? '+' : ''}${cur.gainDb.toFixed(1)} dB)` : ''}`));
       this.emit('track', this.current);
-    } else {
+    } else if (Date.now() - (this.lastEmptyWarn || 0) > 30000) {
+      this.lastEmptyWarn = Date.now();
       logWarn('library empty — streaming silence until songs appear');
     }
   }
@@ -1517,6 +1590,78 @@ function loudnessGainDb(m, kind = 'song') {
 // half-finished SFTP upload is never processed. Originals move to intros/raw/done/.
 // ---------------------------------------------------------------------------
 
+function dbToLinear(db) {
+  return Math.pow(10, db / 20);
+}
+
+// The broadcast chain, in the order a station would run it:
+//   high-pass -> downward expander -> de-esser -> presence EQ -> echo -> compressor -> limiter
+// The echo sits after the expander (so its tails are not ducked as noise) and before the
+// dynamics (so the compressor evens it out and the limiter guarantees the ceiling).
+function voiceChainFilters({ echo = true, chain = true } = {}) {
+  const f = [];
+  if (chain && CONFIG.voiceChain) {
+    if (CONFIG.voiceHpfHz > 0) f.push(`highpass=f=${CONFIG.voiceHpfHz}:poles=2`);
+    if (CONFIG.voiceExpander) {
+      f.push([
+        'agate=mode=downward',
+        `threshold=${clampLinear(dbToLinear(CONFIG.voiceExpThresholdDb), 0, 1)}`,
+        `ratio=${CONFIG.voiceExpRatio}`,
+        `range=${clampLinear(dbToLinear(CONFIG.voiceExpRangeDb), 0, 1)}`,
+        `attack=${CONFIG.voiceExpAttackMs}`,
+        `release=${CONFIG.voiceExpReleaseMs}`,
+        'knee=4:detection=rms',
+      ].join(':'));
+    }
+    if (CONFIG.voiceDeess) {
+      f.push(`deesser=i=${CONFIG.voiceDeessIntensity}:m=${CONFIG.voiceDeessMax}:f=${CONFIG.voiceDeessFreq}:s=o`);
+    }
+    if (CONFIG.voiceEq && CONFIG.voiceEqGainDb !== 0) {
+      f.push(`equalizer=f=${CONFIG.voiceEqHz}:t=q:w=${CONFIG.voiceEqQ}:g=${CONFIG.voiceEqGainDb}`);
+    }
+  }
+  if (echo) f.push(echoFilter());
+  if (chain && CONFIG.voiceChain) {
+    if (CONFIG.voiceComp) {
+      f.push([
+        'acompressor=mode=downward',
+        `threshold=${clampLinear(dbToLinear(CONFIG.voiceCompThresholdDb), 0.000976563, 1)}`,
+        `ratio=${CONFIG.voiceCompRatio}`,
+        `attack=${CONFIG.voiceCompAttackMs}`,
+        `release=${CONFIG.voiceCompReleaseMs}`,
+        `makeup=${clampLinear(dbToLinear(CONFIG.voiceCompMakeupDb), 1, 64)}`,
+        'knee=4:detection=rms',
+      ].join(':'));
+    }
+    if (CONFIG.voiceLimit) {
+      // level=disabled, or alimiter normalises back to full scale and undoes our levelling.
+      f.push(`alimiter=limit=${clampLinear(dbToLinear(CONFIG.voiceLimitCeilingDb), 0.0625, 1)}:attack=5:release=50:level=disabled:latency=1`);
+    }
+  }
+  return f;
+}
+
+// Short human summary of the active stages, for the log and the `fx` command.
+function describeVoiceChain() {
+  const on = [];
+  if (CONFIG.voiceChain) {
+    if (CONFIG.voiceHpfHz > 0) on.push(`hpf ${CONFIG.voiceHpfHz}Hz`);
+    if (CONFIG.voiceExpander) on.push(`expander ${CONFIG.voiceExpThresholdDb}dB`);
+    if (CONFIG.voiceDeess) on.push(`de-ess ${CONFIG.voiceDeessIntensity}`);
+    if (CONFIG.voiceEq && CONFIG.voiceEqGainDb !== 0) on.push(`eq ${CONFIG.voiceEqGainDb >= 0 ? '+' : ''}${CONFIG.voiceEqGainDb}dB@${CONFIG.voiceEqHz}`);
+  }
+  on.push(`echo ${CONFIG.processEchoDelayMs}ms/${CONFIG.processEchoDecay}`);
+  if (CONFIG.voiceChain) {
+    if (CONFIG.voiceComp) on.push(`comp ${CONFIG.voiceCompRatio}:1@${CONFIG.voiceCompThresholdDb}dB`);
+    if (CONFIG.voiceLimit) on.push(`limit ${CONFIG.voiceLimitCeilingDb}dB`);
+  }
+  return on.join(' > ');
+}
+
+function clampLinear(v, lo, hi) {
+  return Math.min(hi, Math.max(lo, v)).toFixed(6);
+}
+
 function echoFilter() {
   const taps = 12;
   const delays = [], decays = [];
@@ -1549,7 +1694,21 @@ async function processRawFile(src, { echo = true, destDir = CONFIG.genericBumper
   ensureDir(destDir);
   const dest = path.join(destDir, `${base}.mp3`);
   const tmp = path.join(CONFIG.rawIntrosDir, `.${base}.tmp.mp3`);
-  const chain = echo ? [echoFilter()] : [];
+
+  // The expander and compressor thresholds are absolute, so a quiet take would slip under
+  // them and a hot one would be crushed. Level the take first and the chain behaves the
+  // same whatever the recording level was.
+  let preGainDb = 0;
+  if (echo && CONFIG.voiceChain) {
+    const lufs = await measureInputLufs(src);
+    if (lufs !== null && lufs > -70) {
+      preGainDb = Math.max(-24, Math.min(24, CONFIG.voiceInputTargetLufs - lufs));
+    }
+  }
+
+  // `clean` sources (intros/raw/*/clean) stay untouched apart from the gain.
+  const chain = voiceChainFilters({ echo, chain: echo });
+  if (preGainDb !== 0) chain.unshift(`volume=${preGainDb.toFixed(2)}dB`);
 
   // pass 1: measure the peak after the effect
   const report = await runFfmpeg(['-i', src, '-vn', '-af', [...chain, 'volumedetect'].join(','), '-f', 'null', '-']);
@@ -1565,7 +1724,20 @@ async function processRawFile(src, { echo = true, destDir = CONFIG.genericBumper
   const doneDir = path.join(CONFIG.rawIntrosDir, 'done');
   ensureDir(doneDir);
   fs.renameSync(src, path.join(doneDir, path.basename(src)));
-  return { dest, gainDb };
+  return { dest, gainDb, preGainDb };
+}
+
+// Integrated loudness of the source take, for the pre-gain.
+async function measureInputLufs(src) {
+  try {
+    const out = await runFfmpeg(['-i', src, '-vn', '-af', 'loudnorm=print_format=json', '-f', 'null', '-']);
+    const m = /\{[^{}]*"input_i"[^{}]*\}/.exec(out);
+    if (!m) return null;
+    const v = Number(JSON.parse(m[0]).input_i);
+    return Number.isFinite(v) ? v : null;
+  } catch {
+    return null;
+  }
 }
 
 class RawProcessor {
@@ -1631,8 +1803,10 @@ class RawProcessor {
       for (const f of ready) {
         try {
           const echo = this.echoFor.get(f) !== false;
-          const { dest, gainDb } = await processRawFile(f, { echo, destDir: this.destFor.get(f) });
-          logInfo(`${COLORS.magenta}processed${COLORS.reset} ${path.basename(f)} -> ${path.relative(__dirname, dest)} (${echo ? `echo ${CONFIG.processEchoDelayMs}ms/${CONFIG.processEchoDecay}, ` : 'no effect, '}gain ${gainDb >= 0 ? '+' : ''}${gainDb.toFixed(1)} dB)`);
+          const { dest, gainDb, preGainDb } = await processRawFile(f, { echo, destDir: this.destFor.get(f) });
+          const stages = echo ? describeVoiceChain() : 'no effect';
+          const pre = preGainDb ? `in ${preGainDb >= 0 ? '+' : ''}${preGainDb.toFixed(1)} dB > ` : '';
+          logInfo(`${COLORS.magenta}processed${COLORS.reset} ${path.basename(f)} -> ${path.relative(__dirname, dest)} (${pre}${stages}, out ${gainDb >= 0 ? '+' : ''}${gainDb.toFixed(1)} dB)`);
           this.seen.delete(f);
         } catch (e) {
           logErr(`failed to process ${path.basename(f)}: ${e.message} (will retry if the file changes)`);
@@ -1643,6 +1817,231 @@ class RawProcessor {
     } finally {
       this.busy = false;
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Playlist export: render a whole playlist, bumpers and intros included, into one
+// mp3 for archiving. Nothing to do with the live stream — it runs as fast as the
+// CPU allows, at low priority, and writes a tracklist and a .cue beside the audio.
+// ---------------------------------------------------------------------------
+
+function timecode(seconds) {
+  const t = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t % 3600) / 60);
+  const s = t % 60;
+  return (h ? `${h}:${String(m).padStart(2, '0')}` : `${m}`) + `:${String(s).padStart(2, '0')}`;
+}
+
+// CUE wants mm:ss:ff with 75 frames per second, and minutes are not wrapped into hours.
+function cueTime(seconds) {
+  const total = Math.max(0, seconds);
+  const m = Math.floor(total / 60);
+  const s = Math.floor(total % 60);
+  const f = Math.floor((total - Math.floor(total)) * 75);
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}:${String(f).padStart(2, '0')}`;
+}
+
+function cueEscape(text) {
+  return String(text).replace(/"/g, "'").slice(0, 200);
+}
+
+class Exporter {
+  constructor(scheduler) {
+    this.scheduler = scheduler;
+    this.current = null;
+    this.log = [];
+    this.cancelled = false;
+  }
+
+  status() {
+    return { running: this.current, recent: this.log.slice(-5) };
+  }
+
+  // Build the running order without touching any live playout state.
+  buildRunOrder(songs, { bumpers = true } = {}) {
+    const items = [];
+    let sinceBumper = 0;
+    for (const song of songs) {
+      const intro = this.scheduler.findMatchingIntro(song);
+      if (bumpers) {
+        if (intro) {
+          items.push({ file: intro, kind: 'intro' });
+        } else if (CONFIG.bumperEvery > 0) {
+          sinceBumper += 1;
+          if (sinceBumper >= CONFIG.bumperEvery) {
+            const bumper = pickRandom(this.scheduler.genericBumpers);
+            if (bumper) {
+              items.push({ file: bumper, kind: 'bumper' });
+              sinceBumper = 0;
+            }
+          }
+        }
+      }
+      items.push({ file: song, kind: 'song' });
+    }
+    return items;
+  }
+
+  start(spec, { order = null, name = '', bumpers = true, limit = 0 } = {}) {
+    if (this.current) return `an export is already running (${this.current.name}, ${this.current.done}/${this.current.total})`;
+
+    this.scheduler.refresh();
+    const names = parsePlaylistSpec(spec || this.scheduler.active.join(','));
+    const lists = this.scheduler.playlists;
+    const unknown = names.filter(n => n !== 'all' && !lists.has(n));
+    if (unknown.length) return `no such playlist: ${unknown.join(', ')} (have: ${[...lists.keys()].join(', ')})`;
+
+    let songs = names.includes('all')
+      ? [...new Set([...lists.values()].flat())]
+      : names.flatMap(n => lists.get(n) || []);
+    if (!songs.length) return `playlist ${names.join(', ')} has no songs`;
+
+    const useOrder = order || this.scheduler.order;
+    if (useOrder === 'sequential') {
+      const rel = f => path.relative(CONFIG.songsDir, f);
+      const rank = new Map();
+      for (const f of songs) {
+        const list = readOrderFile(path.dirname(f));
+        const i = list ? list.indexOf(normalizeName(path.basename(f, path.extname(f)))) : -1;
+        rank.set(f, i < 0 ? Infinity : i);
+      }
+      songs = [...songs].sort((a, b) => (rank.get(a) - rank.get(b)) || naturalOrder.compare(rel(a), rel(b)));
+    } else {
+      songs = shuffle(songs);
+    }
+    if (limit > 0) songs = songs.slice(0, limit);
+
+    const base = (name || `${names.join('-')}-${useOrder}-${new Date().toISOString().slice(0, 10)}`)
+      .replace(/[\\/:*?"<>|]/g, '_');
+    const items = this.buildRunOrder(songs, { bumpers });
+
+    this.cancelled = false;
+    this.current = { name: base, playlist: names.join(', '), order: useOrder, total: items.length, done: 0, songs: songs.length, startedAt: new Date().toISOString() };
+    this.run(items, base).catch(e => logErr(`export failed: ${e.message}`)).finally(() => {
+      this.log.push({ ...this.current, finishedAt: new Date().toISOString() });
+      this.current = null;
+    });
+    return `exporting ${songs.length} songs (${items.length} items, ${useOrder}) to exports/${base}.mp3 — watch the console`;
+  }
+
+  cancel() {
+    if (!this.current) return 'no export running';
+    this.cancelled = true;
+    return `cancelling export ${this.current.name}`;
+  }
+
+  // Decode one file, with its playback gain applied, into the open encoder.
+  decodeInto(item, encoderStdin, onBytes) {
+    return new Promise((resolve, reject) => {
+      const filters = [];
+      if (CONFIG.normalize && item.gainDb) filters.push(`volume=${item.gainDb.toFixed(2)}dB`);
+      if (CONFIG.volume !== 1) filters.push(`volume=${CONFIG.volume}`);
+      const [cmd, ...rest] = backgroundFfmpeg([
+        '-i', item.file, '-vn', '-map', '0:a:0',
+        ...(filters.length ? ['-af', filters.join(',')] : []),
+        '-f', 's16le', '-ar', String(CONFIG.sampleRate), '-ac', String(CONFIG.channels), 'pipe:1',
+      ]);
+      const dec = spawn(cmd, rest, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      let err = '';
+      let ended = false;
+      let closed = false;
+      const done = () => { if (ended && closed) resolve(); };
+      dec.stdout.on('data', c => onBytes(c.length));
+      dec.stdout.pipe(encoderStdin, { end: false });
+      dec.stdout.on('end', () => { ended = true; done(); });
+      dec.stderr.on('data', d => { err += d.toString(); });
+      dec.on('error', reject);
+      dec.on('close', code => {
+        closed = true;
+        if (code && code !== 0) return reject(new Error(`${path.basename(item.file)}: ${err.trim().split(/\r?\n/).pop() || `exit ${code}`}`));
+        done();
+      });
+      this.activeDecoder = dec;
+    });
+  }
+
+  async run(items, base) {
+    const dir = CONFIG.exportsDir;
+    ensureDir(dir);
+    const outPath = path.join(dir, `${base}.mp3`);
+    const tmpPath = path.join(dir, `.${base}.part.mp3`);
+
+    // Playback gain and titles up front, so the tracklist is right even if a file is odd.
+    for (const item of items) {
+      const meta = await probe(item.file);
+      const parsed = parseSongInfo(item.file);
+      item.artist = (meta && meta.artist) || parsed.artist;
+      item.title = (meta && meta.title) || parsed.title;
+      item.gainDb = CONFIG.normalize ? loudnessGainDb(await measureLoudness(item.file), item.kind) : 0;
+    }
+
+    const [ecmd, ...erest] = backgroundFfmpeg([
+      '-y', '-f', 's16le', '-ar', String(CONFIG.sampleRate), '-ac', String(CONFIG.channels),
+      '-channel_layout', CONFIG.channels === 1 ? 'mono' : 'stereo', '-i', 'pipe:0',
+      '-c:a', 'libmp3lame', '-b:a', `${CONFIG.bitrate}k`, '-id3v2_version', '3',
+      '-metadata', `title=${base}`, '-metadata', `artist=${CONFIG.name}`, '-metadata', `album=${CONFIG.name}`,
+      tmpPath,
+    ]);
+    const enc = spawn(ecmd, erest, { stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true });
+    let encErr = '';
+    enc.stderr.on('data', d => { encErr += d.toString(); });
+    const encDone = new Promise((resolve, reject) => {
+      enc.on('error', reject);
+      enc.on('close', code => (code === 0 ? resolve() : reject(new Error(encErr.trim().split(/\r?\n/).pop() || `encoder exit ${code}`))));
+    });
+    enc.stdin.on('error', () => { /* reported through encDone */ });
+
+    const bytesPerSecond = CONFIG.sampleRate * CONFIG.channels * 2;
+    let bytes = 0;
+    const marks = [];
+    const t0 = Date.now();
+
+    // A track in the tracklist starts at its bumper/intro, so skipping to track N in a
+    // player lands on the lead-in rather than dropping you mid-announcement.
+    let blockStart = null;
+    try {
+      for (const [i, item] of items.entries()) {
+        if (this.cancelled) throw new Error('cancelled');
+        const startSec = bytes / bytesPerSecond;
+        if (blockStart === null) blockStart = startSec;
+        if (item.kind === 'song') marks.push({ at: blockStart, artist: item.artist, title: item.title });
+
+        await this.decodeInto(item, enc.stdin, n => { bytes += n; });
+        this.current.done = i + 1;
+
+        if (item.kind === 'song') {
+          blockStart = null;
+          logInfo(`[export ${i + 1}/${items.length}] ${item.artist ? `${item.artist} - ` : ''}${item.title} (${(bytes / bytesPerSecond / 60).toFixed(1)} min so far)`);
+        }
+      }
+    } finally {
+      enc.stdin.end();
+    }
+    await encDone;
+    fs.renameSync(tmpPath, outPath);
+
+    // tracklist + cue
+    const total = bytes / bytesPerSecond;
+    const lines = marks.map((m, i) => `${String(i + 1).padStart(2, '0')}. ${timecode(m.at)}  ${m.artist ? `${m.artist} - ` : ''}${m.title}`);
+    fs.writeFileSync(path.join(dir, `${base}.txt`),
+      `${CONFIG.name} — ${this.current.playlist} (${this.current.order})${String.fromCharCode(10)}` +
+      `${marks.length} tracks, ${timecode(total)}, rendered ${new Date().toISOString()}${String.fromCharCode(10)}${String.fromCharCode(10)}` +
+      lines.join(String.fromCharCode(10)) + String.fromCharCode(10));
+
+    const cue = [`PERFORMER "${cueEscape(CONFIG.name)}"`, `TITLE "${cueEscape(base)}"`, `FILE "${base}.mp3" MP3`];
+    marks.forEach((m, i) => {
+      cue.push(`  TRACK ${String(i + 1).padStart(2, '0')} AUDIO`);
+      cue.push(`    TITLE "${cueEscape(m.title)}"`);
+      cue.push(`    PERFORMER "${cueEscape(m.artist || CONFIG.name)}"`);
+      cue.push(`    INDEX 01 ${cueTime(m.at)}`);
+    });
+    fs.writeFileSync(path.join(dir, `${base}.cue`), cue.join(String.fromCharCode(10)) + String.fromCharCode(10));
+
+    const sizeMB = (fs.statSync(outPath).size / 1048576).toFixed(1);
+    const took = Math.round((Date.now() - t0) / 1000);
+    logInfo(`${COLORS.magenta}export done${COLORS.reset} exports/${base}.mp3 — ${marks.length} tracks, ${timecode(total)}, ${sizeMB} MB, took ${took}s (tracklist: ${base}.txt, cue: ${base}.cue)`);
   }
 }
 
@@ -1684,6 +2083,8 @@ function nowPlayingText(playout, broadcaster, hlsAudience, delay) {
     `position=${n ? (n.position || 0).toFixed(1) : '0.0'}`,
     `duration=${n && n.duration ? n.duration.toFixed(1) : '0.0'}`,
     `next=${st.next ? st.next.display : ''}`,
+    `playlist=${st.playlist ? st.playlist.display : ''}`,
+    `playlistId=${st.playlist ? st.playlist.active.join(',') : ''}`,
     `listeners=${broadcaster.listeners.size + hlsAudience.size}`,
     `delay=${delay}`,
     `serverTime=${Math.round(Date.now() / 1000)}`,
@@ -1793,6 +2194,46 @@ class HlsAudience {
   }
 }
 
+// Archive renders. Supports Range so a browser can scrub a long file.
+function serveExport(req, res, urlPath) {
+  const rel = decodeURIComponent(urlPath.slice('/exports/'.length));
+  if (!rel) {
+    let files = [];
+    try {
+      files = fs.readdirSync(CONFIG.exportsDir)
+        .filter(f => !f.startsWith('.'))
+        .map(f => ({ f, s: fs.statSync(path.join(CONFIG.exportsDir, f)) }))
+        .sort((a, b) => b.s.mtimeMs - a.s.mtimeMs)
+        .map(({ f, s }) => `${f}\t${(s.size / 1048576).toFixed(1)} MB`);
+    } catch { /* none yet */ }
+    return sendText(req, res, 200, files.join(String.fromCharCode(10)) + String.fromCharCode(10));
+  }
+  const abs = path.resolve(CONFIG.exportsDir, rel);
+  if (!abs.startsWith(path.resolve(CONFIG.exportsDir)) || rel.includes('..')) return sendText(req, res, 400, 'Bad path');
+  fs.stat(abs, (err, st) => {
+    if (err || !st.isFile()) return sendText(req, res, 404, '404 Not found');
+    const ext = path.extname(abs).toLowerCase();
+    const type = ext === '.mp3' ? 'audio/mpeg' : ext === '.cue' ? 'application/x-cue' : 'text/plain; charset=utf-8';
+    const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+    const headers = { 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache' };
+    if (range && ext === '.mp3') {
+      const start = range[1] ? Number(range[1]) : 0;
+      const end = range[2] ? Number(range[2]) : st.size - 1;
+      if (start >= st.size || start > end) {
+        res.writeHead(416, { 'Content-Range': `bytes */${st.size}` });
+        return res.end();
+      }
+      res.writeHead(206, { ...headers, 'Content-Length': end - start + 1, 'Content-Range': `bytes ${start}-${end}/${st.size}` });
+      if (req.method === 'HEAD') return res.end();
+      return fs.createReadStream(abs, { start, end }).on('error', () => res.destroy()).pipe(res);
+    }
+    res.writeHead(200, { ...headers, 'Content-Length': st.size });
+    if (req.method === 'HEAD') return res.end();
+    fs.createReadStream(abs).on('error', () => res.destroy()).pipe(res);
+    logReq(req, 200);
+  });
+}
+
 function serveHls(req, res, urlPath, hlsAudience) {
   const rel = urlPath.slice('/hls/'.length);
   const abs = path.resolve(CONFIG.hlsDir, rel);
@@ -1824,6 +2265,8 @@ function pageHtml(req) {
   main{width:min(560px,92vw);padding:28px;border:1px solid #2a2d36;border-radius:14px;background:#171a21}
   h1{margin:0 0 4px;font-size:22px}.live{display:inline-block;background:#e0302f;color:#fff;font-size:11px;font-weight:700;letter-spacing:.1em;padding:2px 8px;border-radius:999px;vertical-align:middle;margin-left:8px}
   .muted{color:#8a8f9c}.now{font-size:19px;margin:14px 0 2px}audio{display:none}code{background:#0d0f13;padding:2px 6px;border-radius:6px;font-size:13px}
+  .pill{display:inline-block;margin-top:8px;padding:3px 10px;border:1px solid #2a2d36;border-radius:999px;font-size:12px;color:#b9c0cf;background:#13161d}
+  .pill:empty{display:none}
   .controls{display:flex;align-items:center;gap:12px;margin:18px 0 10px}
   .controls button{width:44px;height:44px;border-radius:50%;border:1px solid #2a2d36;background:#20242e;color:#e6e6ea;font-size:16px;cursor:pointer;line-height:1}
   .controls button:hover{background:#262b36}
@@ -1832,6 +2275,7 @@ function pageHtml(req) {
 </style></head><body><main>
 <h1>${escapeHtml(CONFIG.name)}<span class="live">LIVE</span></h1>
 <div class="muted">${escapeHtml(CONFIG.description)}</div>
+<div class="pill" id="playlist"></div>
 <div class="now" id="now">…</div><div class="muted" id="time"></div><div class="bar"><i id="bar"></i></div>
 <div class="muted" id="next" style="margin-top:8px"></div>
 <audio id="player" preload="none"${CONFIG.hls ? '' : ` src="${CONFIG.mount}"`}></audio>
@@ -1882,6 +2326,7 @@ document.getElementById('time').textContent=n?fmt(n.position)+(n.duration?' / '+
 document.getElementById('bar').style.width=n&&n.duration?Math.min(100,100*n.position/n.duration)+'%':'0';
 document.getElementById('next').textContent=j.next?'Up next: '+j.next.display:'';
 document.getElementById('listeners').textContent=j.listeners+' listening';
+document.getElementById('playlist').textContent=j.playlist&&j.playlist.display?j.playlist.display:'';
 document.getElementById('sync').textContent=measured===null?'':('sync '+lag.toFixed(1)+'s behind live'+(trim?' (trim '+(trim>0?'+':'')+trim+')':''));
 }catch(e){}}
 poll();setInterval(poll,2000);
@@ -1896,7 +2341,7 @@ function authorized(url) {
   return CONFIG.adminToken && url.searchParams.get('token') === CONFIG.adminToken;
 }
 
-function createServer(playout, broadcaster, importer, hlsAudience) {
+function createServer(playout, broadcaster, importer, hlsAudience, exporter) {
   const server = http.createServer((req, res) => {
     let url;
     try {
@@ -1950,16 +2395,26 @@ function createServer(playout, broadcaster, importer, hlsAudience) {
     }
 
     if (CONFIG.hls && p.startsWith('/hls/')) return serveHls(req, res, p, hlsAudience);
+    if (p.startsWith('/exports/')) return serveExport(req, res, p);
 
     if (importer && p.startsWith('/spotify/')) {
       importer.handleHttp(req, res, url, sendText, authorized).then(handled => { if (!handled) sendText(req, res, 404, '404 Not found'); });
       return;
     }
 
-    if (p === '/skip' || p === '/reload' || p === '/seek' || p === '/playlist' || p === '/import' || p === '/play') {
+    if (p === '/skip' || p === '/reload' || p === '/seek' || p === '/playlist' || p === '/import' || p === '/play' || p === '/export') {
       if (req.method !== 'POST') return sendText(req, res, 405, 'POST required');
       if (!authorized(url)) return sendText(req, res, 403, 'Forbidden');
       if (p === '/skip') return sendText(req, res, 200, playout.skip() ? 'skipped' : 'nothing playing');
+      if (p === '/export') {
+        if (!exporter) return sendText(req, res, 503, 'exporter not ready');
+        return sendText(req, res, 200, exporter.start(url.searchParams.get('playlist') || '', {
+          order: parseOrderWord(url.searchParams.get('order') || ''),
+          name: url.searchParams.get('name') || '',
+          bumpers: url.searchParams.get('bumpers') !== '0',
+          limit: Number(url.searchParams.get('limit')) || 0,
+        }));
+      }
       if (p === '/import') {
         if (!importer) return sendText(req, res, 501, 'importer.mjs not installed');
         return sendText(req, res, 200, importer.enqueue(url.searchParams.get('url') || '', url.searchParams.get('folder') || '', Number(url.searchParams.get('limit')) || 0));
@@ -2030,6 +2485,7 @@ async function main() {
 
   const scheduler = new RadioScheduler();
   const rawProcessor = new RawProcessor(() => scheduler.refresh());
+  const exporter = new Exporter(scheduler);
   // Optional playlist importer (importer.mjs next to this file). Absent = command disabled.
   let importer = null;
   try {
@@ -2046,7 +2502,7 @@ async function main() {
   const hlsAudience = new HlsAudience();
   encoder.on('data', chunk => broadcaster.onEncoded(chunk));
 
-  const server = createServer(playout, broadcaster, importer, hlsAudience);
+  const server = createServer(playout, broadcaster, importer, hlsAudience, exporter);
   server.on('error', err => {
     logErr(`http server error: ${err.message}`);
     process.exit(1);
@@ -2094,7 +2550,7 @@ async function main() {
       const parts = arg.trim().split(/\s+/).filter(Boolean);
       if (!parts.length) {
         const i = scheduler.playlistInfo();
-        return `active: ${i.active.join(', ')} (${i.order}) — available: ${Object.entries(i.available).map(([n, c]) => `${n} (${c})`).join(', ')}`;
+        return `active: ${i.display} [${i.active.join(', ')}] (${i.order}) — available: ${Object.entries(i.available).map(([n, c]) => `${i.names[n]} / ${n} (${c})`).join(', ')}`;
       }
       if (parts[0].toLowerCase() === 'reset') return playout.setPlaylist('', { reset: true });
 
@@ -2179,6 +2635,37 @@ async function main() {
       return `song intros: ${all.length - missing.length}/${all.length} songs covered; ${missing.length} missing (listed in ${path.relative(__dirname, report)})` +
         (unused.length ? `; ${unused.length} intro file(s) match no song: ${unused.map(u => path.basename(u)).join(', ')}` : '');
     },
+    export: arg => {
+      const parts = arg.trim().split(/\s+/).filter(Boolean);
+      if (parts[0] === 'cancel') return exporter.cancel();
+      let order = null;
+      let bumpers = true;
+      let limit = 0;
+      const rest = [];
+      const known = scheduler.scanPlaylists();
+      for (const w of parts) {
+        const l = w.toLowerCase();
+        if (known.has(l)) { rest.push(w); continue; }
+        const o = parseOrderWord(l);
+        if (o) { order = o; continue; }
+        if (l === 'nobumpers' || l === 'no-bumpers') { bumpers = false; continue; }
+        if (/^\d+$/.test(l)) { limit = Number(l); continue; }
+        rest.push(w);
+      }
+      const spec = rest.shift() || '';
+      return exporter.start(spec, { order, name: rest.join(' '), bumpers, limit });
+    },
+    exports: () => {
+      const st = exporter.status();
+      const running = st.running ? `running: ${st.running.name} (${st.running.done}/${st.running.total})` : 'nothing running';
+      let listed = [];
+      try {
+        listed = fs.readdirSync(CONFIG.exportsDir).filter(f => f.endsWith('.mp3'))
+          .map(f => `${f} (${(fs.statSync(path.join(CONFIG.exportsDir, f)).size / 1048576).toFixed(1)} MB)`);
+      } catch { /* no exports yet */ }
+      return `${running}${String.fromCharCode(10)}on disk: ${listed.join(', ') || 'none'}`;
+    },
+    fx: () => `${describeVoiceChain()}${String.fromCharCode(10)}ffmpeg -af "${voiceChainFilters({}).join(',')}"`,
     process: () => { rawProcessor.scan(true).catch(e => logErr(e.message)); return `processing ${CONFIG.rawIntrosDir}`; },
     check: arg => {
       // check            bumpers + song intros
@@ -2218,7 +2705,7 @@ async function main() {
       return '';
     },
     stop: () => { shutdown(); return ''; },
-    help: () => 'commands: skip | play <song> [now] | seek +30 | seek 1:30 | now | queue | bumper [name] | playlists | playlist <name> [now] | import <url> [folder] | imports | spotify | ytdlp | listeners | check [all|<playlist>] | intros | hourly [play [hour]] | process | reload | stop',
+    help: () => 'commands: skip | play <song> [now] | seek +30 | seek 1:30 | now | queue | bumper [name] | playlists | playlist <name> [now] | import <url> [folder] | imports | spotify | ytdlp | listeners | check [all|<playlist>] | export <playlist> [sequential|random] [nobumpers] | exports | fx | intros | hourly [play [hour]] | process | reload | stop',
   };
   process.stdin.on('data', chunk => {
     for (const line of chunk.toString().split(/\r?\n/)) {

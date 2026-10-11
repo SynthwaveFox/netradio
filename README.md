@@ -61,6 +61,19 @@ reports `playlist.active`, `playlist.order` and `playlist.available`. A switch d
 was queued from the old playlist. If the selected playlist does not exist or is empty,
 everything is played (with a warning) rather than going silent.
 
+**Display names.** `playlist-names.json` next to the server maps folder names to what
+listeners see:
+
+```json
+{ "default": "Starlight Rotation", "halloween": "Halloween Spooktacular" }
+```
+
+Anything not listed falls back to the folder name tidied up (`synthwave-80s` →
+`Synthwave 80s`). The file is re-read when it changes, so renaming needs no restart. The
+name appears on the web page, in `/now.json` as `playlist.display`, in `/now.txt` as
+`playlist=` (with the raw folder in `playlistId=`), and in the `playlists` console output.
+`playlist-names.example.json` is a starting point.
+
 **The choice persists across restarts** — playlist and order are saved to
 `playlist-state.json`, and the startup banner shows `(sequential, restored)`. `PLAYLIST` /
 `PLAYLIST_ORDER` in `.env` are only the defaults before anything has been chosen;
@@ -151,14 +164,75 @@ to get the same processing as bumpers.
 need one to `intros/songs/missing-intros.txt`, and flags intro files that match no song
 (usually a typo in the name).
 
+### Exporting a playlist to one file (archive)
+
+Renders a whole playlist — bumpers, song intros and all — into a single mp3 for on-demand
+listening. Nothing to do with the broadcast: it runs as fast as the CPU allows (roughly 90x
+realtime) at low priority, and is safe to run while the station is live.
+
+```
+export halloween                     active order, bumpers included
+export halloween sequential          force play order (order.txt, else file name)
+export halloween random my-mixtape   random order, named output
+export halloween nobumpers           songs only
+export halloween random 20           cap at 20 songs
+export cancel                        stop the running export
+exports                              progress + what is already rendered
+```
+
+or `POST /export?token=…&playlist=halloween&order=random&name=…&bumpers=0&limit=20`.
+
+Output lands in `exports/` as three files:
+
+- `<name>.mp3` — one gapless render, with the same per-track loudness levelling the live
+  stream uses, so it sounds like the station
+- `<name>.txt` — tracklist with timestamps
+- `<name>.cue` — so foobar2000/VLC can treat it as separate tracks; each track begins at its
+  bumper, so skipping lands on the lead-in rather than mid-announcement
+
+Download them over HTTP rather than SFTP: `GET /exports/` lists what is there and
+`GET /exports/<name>.mp3` serves it (with Range support, so a browser can scrub). Those are
+public — anyone with the URL can fetch a render — so keep that in mind if a playlist is not
+something you want handed out. One export runs at a time.
+
 ### Bumper processing (`intros/raw/`)
 
 Anything dropped into `intros/raw/` is processed by the server's ffmpeg and written to
 `intros/generic/<name>.mp3`; the original moves to `intros/raw/done/`. Processing =
 
-1. the station's "radio voice" effect: Audacity **Echo, delay 0.01 s, decay 0.5**
-   (a 10 ms feedback comb — reproduced exactly as a 12-tap `aecho`), then
+1. the broadcast voice chain below (high-pass, expander, de-esser, presence EQ,
+   compressor, limiter) around the station's "radio voice" effect: Audacity **Echo,
+   delay 0.01 s, decay 0.5** (a 10 ms feedback comb — reproduced exactly as a 12-tap
+   `aecho`), then
 2. peak-normalise to `PROCESS_PEAK_DB` (default -1 dB).
+
+### The voice chain
+
+Raw takes go through a standard broadcast chain before the echo, so a bedroom recording
+comes out sounding like a station mic:
+
+| | Stage | Default |
+|---|---|---|
+| 0 | **level the take** (so every later threshold means the same thing whatever you recorded at) | to -20 LUFS |
+| 1 | **high-pass** — cuts rumble below the voice | 100 Hz, -3 dB at the corner |
+| 2 | **downward expander** — fan, keyboard and breath get quieter between words | -32 dB, 2:1, max -16 dB |
+| 3 | **de-esser** — tames sharp S sounds only | intensity 0.6 (~-5 dB on sibilance) |
+| 4 | **presence EQ** — the band that makes words clear | +4 dB at 3500 Hz |
+| — | **echo** — the station's robotic character | 10 ms / 0.5 |
+| 5 | **compressor** — steadier volume, voice sits forward | 3:1 above -24 dB |
+| 6 | **limiter** — a ceiling a laugh or shout cannot pass | -1 dB |
+
+The echo sits after the expander (so its tails are not ducked as noise) and before the
+dynamics (so the compressor evens it out and the limiter guarantees the ceiling). Every
+stage has its own `VOICE_*` setting and can be switched off on its own; `VOICE_CHAIN=0`
+leaves just the echo and gain, i.e. the old behaviour. `fx` in the console prints the
+active chain and the exact ffmpeg filter string, so you can paste it elsewhere to A/B.
+
+Two things worth knowing if you tune it:
+
+- Because the take is levelled first, the same line recorded at -46 dB or -17 dB comes out
+  identical. Record at whatever level is convenient.
+- ffmpeg's de-esser does **nothing** below about `i=0.4` — the useful range is 0.5 to 1.0.
 
 Files dropped into `intros/raw/clean/` skip step 1 and are only normalised — for clips that
 should sound clean (sponsor reads, music stings). They land in the same `intros/generic/`
@@ -215,6 +289,8 @@ Console commands (type into the Pterodactyl console or the terminal):
 | `intros` | song-intro coverage report + `missing-intros.txt` |
 | `hourly` / `hourly play [hour]` | time-check coverage and station time / force one at the next break to test |
 | `process` | process everything in `intros/raw/` now |
+| `export <playlist> [sequential\|random] [nobumpers] [name]` / `exports` / `export cancel` | render a playlist to one mp3 for archiving (see Exporting) |
+| `fx` | print the active voice chain and its ffmpeg filter string |
 | `check` / `check all` / `check <playlist>` | full test-decode of bumpers+intros / everything in every playlist / one playlist's songs; reports FAIL with the decoder error |
 | `queue`, `listeners`, `reload`, `stop`, `help` | |
 
@@ -300,7 +376,8 @@ $env:STATION_NAME="Fennia FM"; $env:ADMIN_TOKEN="changeme"; $env:HLS="1"; node n
 ## Now playing in the world (Udon)
 
 `GET /now.txt` returns flat `key=value` lines — `station`, `kind`, `artist`, `title`,
-`display`, `position`, `duration`, `next`, `listeners`, `delay`, `serverTime` — which Udon
+`display`, `position`, `duration`, `next`, `playlist`, `playlistId`, `listeners`, `delay`,
+`serverTime` — which Udon
 can parse without a JSON step. `udon/StarlightNowPlaying.cs` is a ready UdonSharp script:
 drop it on a GameObject, set the URL, assign TextMeshPro fields.
 
