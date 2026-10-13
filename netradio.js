@@ -91,6 +91,8 @@ const CONFIG = {
   bumperOffsetDb: Number(process.env.BUMPER_OFFSET_DB ?? -3),   // bumpers/intros sit this much below the songs
 
   hourlyIntrosDir: process.env.HOURLY_INTROS_DIR || path.join(__dirname, 'intros', 'hourly'),
+  cuesDir: process.env.CUES_DIR || path.join(__dirname, 'intros', 'cues'),   // intros/cues/<event>/*.mp3
+  cueHoldSeconds: Number(process.env.CUE_HOLD_SECONDS || 30),               // keep reporting a cue this long after it airs
   hourlyGraceMinutes: Number(process.env.HOURLY_GRACE_MINUTES || 20), // skip the time check if the break comes later than this
   timezone: validTimezone(process.env.STATION_TZ) || 'America/New_York', // NOT process.env.TZ: containers set that to UTC
   bumperEvery: Number(process.env.BUMPER_EVERY || 1), // generic bumper before every Nth song (0 = never)
@@ -301,6 +303,48 @@ function writeHourlyState(state) {
   try { fs.writeFileSync(HOURLY_STATE_FILE, JSON.stringify(state)); } catch (e) { logWarn(`could not save hourly state: ${e.message}`); }
 }
 
+// cues.json tags any existing clip as a cue, by its path relative to the server folder:
+//   { "intros/songs/Living Dead Girl.mp3": "hijack" }
+// Use this when the trigger is a clip that already plays on its own (a song intro, say)
+// rather than something you fire by hand from intros/cues/<event>/.
+const CUE_MAP_FILE = path.join(__dirname, 'cues.json');
+let cueMapCache = { mtime: 0, size: -1, map: {} };
+
+// Compare paths the same way whatever the OS and however the file was typed:
+// backslashes to slashes, no leading ./, lower case.
+function normalizeCuePath(p) {
+  return String(p).split(String.fromCharCode(92)).join('/').replace(/^\.?\//, '').toLowerCase();
+}
+
+function cueFileMap() {
+  let st;
+  try { st = fs.statSync(CUE_MAP_FILE); } catch { cueMapCache = { mtime: 0, size: -1, map: {} }; return {}; }
+  if (st.mtimeMs === cueMapCache.mtime && st.size === cueMapCache.size) return cueMapCache.map;
+  let map = {};
+  try {
+    for (const [k, v] of Object.entries(JSON.parse(fs.readFileSync(CUE_MAP_FILE, 'utf8')))) {
+      // "path": "event"   or   "path": { "event": "...", "offset": 3.5 }
+      if (typeof v === 'string') {
+        map[normalizeCuePath(k)] = { event: v.toLowerCase(), offset: 0 };
+      } else if (v && typeof v.event === 'string') {
+        map[normalizeCuePath(k)] = { event: v.event.toLowerCase(), offset: Number(v.offset) || 0 };
+      }
+    }
+  } catch (e) {
+    logWarn(`could not read cues.json: ${e.message}`);
+    map = cueMapCache.map;
+  }
+  cueMapCache = { mtime: st.mtimeMs, size: st.size, map };
+  return map;
+}
+
+function cueEventForFile(file) {
+  const map = cueFileMap();
+  if (!Object.keys(map).length) return null;
+  const rel = normalizeCuePath(path.relative(__dirname, file));
+  return map[rel] || null;
+}
+
 const PLAYLIST_STATE_FILE = path.join(__dirname, 'playlist-state.json');
 
 // The live playlist choice survives restarts; `playlist reset` goes back to .env.
@@ -405,6 +449,7 @@ class RadioScheduler {
     this.genericBumpers = [];
     this.songIntroMap = new Map();
     this.hourlyMap = new Map();  // hour (0-23) -> [files]
+    this.cueMap = new Map();     // event name -> [files]; played only on request
     const hourlyState = readHourlyState();
     this.lastHourKey = hourlyState.lastHourKey || null;
     this.lastHourWhy = hourlyState.why || null;
@@ -446,6 +491,27 @@ class RadioScheduler {
   }
 
   // Switch playlists. Returns a message. Takes effect at the next song (see Playout.setPlaylist).
+  // Put the sequential cursor just before `file`, so that song is the next one played and
+  // the rest follow it in order. Switches the playlist if the song lives in another one.
+  startSequentialAt(file) {
+    const owner = [...this.playlists.entries()].find(([, files]) => files.includes(file));
+    if (owner && !this.active.includes('all') && !this.active.includes(owner[0])) {
+      this.active = [owner[0]];
+      this.warnedMissing = false;
+      this.refresh();
+    }
+    this.order = 'sequential';
+    const sorted = this.sortedPool();
+    const idx = sorted.indexOf(file);
+    if (idx < 0) return false;
+    // the cursor is "last played", so sit one before; index 0 wraps to the end
+    this.seqCursor = sorted.length === 1 ? null : sorted[(idx - 1 + sorted.length) % sorted.length];
+    this.resumeAfter = this.seqCursor;
+    this.queue = this.sequenceFrom(this.seqCursor);
+    this.savePlaylistState();
+    return true;
+  }
+
   // Called when a song actually starts playing (not when it is queued), so the resume
   // point reflects what listeners heard rather than what was prefetched.
   noteSongPlaying(file) {
@@ -523,6 +589,15 @@ class RadioScheduler {
     this.songIntroMap = new Map(
       getAudioFilesRecursive(CONFIG.songIntrosDir).map(f => [normalizeName(path.basename(f, path.extname(f))), f])
     );
+
+    this.cueMap = new Map();
+    if (fs.existsSync(CONFIG.cuesDir)) {
+      for (const entry of fs.readdirSync(CONFIG.cuesDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+        const files = getAudioFilesRecursive(path.join(CONFIG.cuesDir, entry.name));
+        if (files.length) this.cueMap.set(entry.name.toLowerCase(), files);
+      }
+    }
 
     this.hourlyMap = new Map();
     for (const f of getAudioFilesRecursive(CONFIG.hourlyIntrosDir)) {
@@ -1040,7 +1115,9 @@ class Playout extends EventEmitter {
           this.pending.shift();
         }
         this.scheduler.songsSinceBumper = 0;
-        this.pending.unshift(new TrackSource(item.file, item.kind).start());
+        const src = new TrackSource(item.file, item.kind);
+        src.cueEvent = item.cueEvent || null;
+        this.pending.unshift(src.start());
       }
     }
 
@@ -1050,6 +1127,14 @@ class Playout extends EventEmitter {
       this.current.startedAt = new Date().toISOString();
       this.fill(); // kick decoding for the following item
       const cur = this.current;
+      const tag = cueEventForFile(cur.file);
+      const cueEvent = cur.cueEvent || (tag && tag.event);
+      const cueOffset = cur.cueEvent ? 0 : (tag ? tag.offset : 0);
+      if (cueEvent) {
+        // Stamped at the encoder; listeners hear it one stream delay later.
+        this.lastCue = { event: cueEvent, id: `${Date.now().toString(36)}-${cueEvent}`, atMs: Date.now(), offset: cueOffset, file: path.basename(cur.file) };
+        logInfo(`${COLORS.magenta}cue${COLORS.reset} "${cueEvent}" on air — fires for listeners in ~${Math.round(this.hlsDelaySeconds() + cueOffset)}s${cueOffset ? ` (${cueOffset}s into the clip)` : ''}`);
+      }
       if (cur.kind === 'song') this.scheduler.noteSongPlaying(cur.file);
       cur.ready.then(() => logInfo(`${COLORS.magenta}▶ ${cur.kind}${COLORS.reset} ${cur.displayTitle}${CONFIG.normalize && cur.loudness ? ` (${cur.loudness.i.toFixed(1)} LUFS, gain ${cur.gainDb >= 0 ? '+' : ''}${cur.gainDb.toFixed(1)} dB)` : ''}`));
       this.emit('track', this.current);
@@ -1126,6 +1211,33 @@ class Playout extends EventEmitter {
   }
 
   // spec: "+30" / "-10" (relative seconds), "90" or "1:30" (absolute). Returns a message.
+  // Start sequential playback at a chosen song and run on from there.
+  jumpTo(query, now = true) {
+    this.scheduler.refresh();
+    const matches = this.scheduler.findSongs(query);
+    if (!matches.length) return `no song matches "${query}"`;
+    if (matches.length > 1) {
+      const names = matches.slice(0, 8).map(f => path.basename(f, path.extname(f)));
+      return `${matches.length} songs match "${query}" — be more specific:${String.fromCharCode(10)}${names.join(String.fromCharCode(10))}${matches.length > 8 ? `${String.fromCharCode(10)}…` : ''}`;
+    }
+    const song = matches[0];
+    if (!this.scheduler.startSequentialAt(song)) return `could not place ${path.basename(song)} in the running order`;
+
+    const name = path.basename(song, path.extname(song));
+    // read the running order before fill() prefetches the next one out of the queue
+    const after = this.scheduler.peekUpcoming(4)
+      .filter(f => f !== song)      // the queue starts with the song itself
+      .slice(0, 3)
+      .map(f => path.basename(f, path.extname(f)));
+
+    for (const t of this.pending) t.destroy();
+    this.pending = [];
+    this.fill();
+    logInfo(`jump: ${this.scheduler.active.join(', ')} sequential from ${name}${now ? ' (now)' : ' (after this track)'}`);
+    if (now) this.advance();
+    return `${now ? 'playing' : 'up next'}: ${name}, then ${after.join(', ') || '(end of list)'}`;
+  }
+
   // Test helper: play an hour's time check at the next break without consuming the
   // once-per-hour state, so a real check still fires when the hour turns.
   forceHourly(hourArg) {
@@ -1139,6 +1251,19 @@ class Playout extends EventEmitter {
     const file = pickRandom(files);
     this.forcedBreak = { file, kind: 'hourly' };
     return `queued: hour ${hour} (${path.basename(file)}) plays at the next break, i.e. when the current song ends (skip past any bumper first)`;
+  }
+
+  // Queue a cue clip: plays like a bumper, and tells the world when listeners will hear it.
+  queueCue(event) {
+    this.scheduler.refresh();
+    const name = String(event || '').trim().toLowerCase();
+    const have = [...this.scheduler.cueMap.keys()];
+    if (!name) return `usage: cue <event> — have: ${have.join(', ') || `none (make ${path.relative(__dirname, CONFIG.cuesDir)}/<event>/clip.mp3)`}`;
+    const files = this.scheduler.cueMap.get(name);
+    if (!files || !files.length) return `no cue "${name}" (have: ${have.join(', ') || 'none'})`;
+    const file = pickRandom(files);
+    this.forcedBreak = { file, kind: 'cue', cueEvent: name };
+    return `cue "${name}" (${path.basename(file)}) plays at the next break; the world is told ${Math.round(this.hlsDelaySeconds())}s before listeners hear it`;
   }
 
   // Queue a specific generic bumper (or a random one) for the next break.
@@ -1289,6 +1414,17 @@ class Playout extends EventEmitter {
     return fromPending();
   }
 
+  // The pending cue as a listener experiences it: `in` is seconds until they hear it start,
+  // negative once it has begun. Clients schedule locally off this instead of polling for it.
+  cueInfo(delay) {
+    const c = this.lastCue;
+    if (!c) return null;
+    const since = (Date.now() - c.atMs) / 1000;
+    const offset = c.offset || 0;
+    if (since > delay + offset + CONFIG.cueHoldSeconds) return null;
+    return { event: c.event, id: c.id, in: delay + offset - since, offset, file: c.file };
+  }
+
   // Seconds an HLS listener trails the playhead (playlist window + one segment of buffer).
   hlsDelaySeconds() {
     return CONFIG.hls ? CONFIG.hlsWindowSegments * CONFIG.hlsSegmentSeconds : 0;
@@ -1305,6 +1441,7 @@ class Playout extends EventEmitter {
         now: nowItem,
         next: this.nextAfterAgo(delay, nowItem),
         playlist: this.scheduler.playlistInfo(),
+        cue: this.cueInfo(delay),
         upcoming: [
           ...(this.current && (!nowItem || nowItem.file !== path.basename(this.current.file)) ? [this.current.displayTitle] : []),
           ...this.pending.filter(t => t.kind === 'song').map(t => t.displayTitle),
@@ -1321,6 +1458,7 @@ class Playout extends EventEmitter {
       now: this.current ? this.current.toJSON() : null,
       next: nextSong ? { kind: nextSong.kind, display: nextSong.displayTitle, file: path.basename(nextSong.file) } : null,
       playlist: this.scheduler.playlistInfo(),
+      cue: this.cueInfo(delay),
       upcoming: [
         ...this.pending.filter(t => t.kind === 'song').map(t => t.displayTitle),
         ...this.scheduler.peekUpcoming(5).map(f => parseSongInfo(f)).map(p => (p.artist ? `${p.artist} - ${p.title}` : p.title)),
@@ -1752,6 +1890,7 @@ class RawProcessor {
     ensureDir(CONFIG.rawCleanIntrosDir);
     ensureDir(path.join(CONFIG.rawIntrosDir, 'songs'));
     ensureDir(path.join(CONFIG.rawIntrosDir, 'hourly'));
+    ensureDir(CONFIG.cuesDir);
     this.timer = setInterval(() => this.scan().catch(e => logErr(`raw scan: ${e.message}`)), 5000);
     this.timer.unref();
     return this.scan();
@@ -2085,6 +2224,9 @@ function nowPlayingText(playout, broadcaster, hlsAudience, delay) {
     `next=${st.next ? st.next.display : ''}`,
     `playlist=${st.playlist ? st.playlist.display : ''}`,
     `playlistId=${st.playlist ? st.playlist.active.join(',') : ''}`,
+    `cue=${st.cue ? st.cue.event : ''}`,
+    `cueId=${st.cue ? st.cue.id : ''}`,
+    `cueIn=${st.cue ? st.cue.in.toFixed(2) : ''}`,
     `listeners=${broadcaster.listeners.size + hlsAudience.size}`,
     `delay=${delay}`,
     `serverTime=${Math.round(Date.now() / 1000)}`,
@@ -2402,7 +2544,7 @@ function createServer(playout, broadcaster, importer, hlsAudience, exporter) {
       return;
     }
 
-    if (p === '/skip' || p === '/reload' || p === '/seek' || p === '/playlist' || p === '/import' || p === '/play' || p === '/export') {
+    if (p === '/skip' || p === '/reload' || p === '/seek' || p === '/playlist' || p === '/import' || p === '/play' || p === '/export' || p === '/cue' || p === '/jump') {
       if (req.method !== 'POST') return sendText(req, res, 405, 'POST required');
       if (!authorized(url)) return sendText(req, res, 403, 'Forbidden');
       if (p === '/skip') return sendText(req, res, 200, playout.skip() ? 'skipped' : 'nothing playing');
@@ -2418,6 +2560,12 @@ function createServer(playout, broadcaster, importer, hlsAudience, exporter) {
       if (p === '/import') {
         if (!importer) return sendText(req, res, 501, 'importer.mjs not installed');
         return sendText(req, res, 200, importer.enqueue(url.searchParams.get('url') || '', url.searchParams.get('folder') || '', Number(url.searchParams.get('limit')) || 0));
+      }
+      if (p === '/cue') {
+        return sendText(req, res, 200, playout.queueCue(url.searchParams.get('event') || ''));
+      }
+      if (p === '/jump') {
+        return sendText(req, res, 200, playout.jumpTo(url.searchParams.get('q') || '', url.searchParams.get('next') !== '1'));
       }
       if (p === '/play') {
         return sendText(req, res, 200, playout.request(url.searchParams.get('q') || '', url.searchParams.get('now') === '1'));
@@ -2540,6 +2688,12 @@ async function main() {
     skip: () => (playout.skip() ? '' : 'nothing playing'),
     next: () => commands.skip(),
     seek: arg => playout.seek(arg),
+    jump: arg => {
+      const parts = arg.trim().split(/\s+/).filter(Boolean);
+      if (!parts.length) return 'usage: jump <part of song name> [next]   — play it and continue sequentially from there';
+      const later = parts[parts.length - 1].toLowerCase() === 'next';
+      return playout.jumpTo((later ? parts.slice(0, -1) : parts).join(' '), !later);
+    },
     play: arg => {
       const parts = arg.trim().split(/\s+/).filter(Boolean);
       if (!parts.length) return 'usage: play <part of song name> [now]';
@@ -2577,6 +2731,14 @@ async function main() {
     },
     playlists: () => commands.playlist(''),
     bumper: arg => playout.queueBumper(arg.trim()),
+    cue: arg => playout.queueCue(arg.trim()),
+    cues: () => {
+      scheduler.refresh();
+      const rows = [...scheduler.cueMap.entries()].map(([k, v]) => `${k} (${v.length})`);
+      const tagged = Object.entries(cueFileMap()).map(([f, e]) => `${e.event}${e.offset ? ` +${e.offset}s` : ''} <- ${f}`);
+      const last = playout.lastCue ? ` | last fired: ${playout.lastCue.event} ${Math.round((Date.now() - playout.lastCue.atMs) / 1000)}s ago` : '';
+      return `cue folders: ${rows.join(', ') || 'none'}${String.fromCharCode(10)}tagged in cues.json: ${tagged.join(', ') || 'none'}${last}`;
+    },
     import: arg => {
       if (!importer) return NO_IMPORTER;
       const [url, folder, limit] = arg.trim().split(/\s+/);
@@ -2705,7 +2867,7 @@ async function main() {
       return '';
     },
     stop: () => { shutdown(); return ''; },
-    help: () => 'commands: skip | play <song> [now] | seek +30 | seek 1:30 | now | queue | bumper [name] | playlists | playlist <name> [now] | import <url> [folder] | imports | spotify | ytdlp | listeners | check [all|<playlist>] | export <playlist> [sequential|random] [nobumpers] | exports | fx | intros | hourly [play [hour]] | process | reload | stop',
+    help: () => 'commands: skip | play <song> [now] | jump <song> [next] | seek +30 | seek 1:30 | now | queue | bumper [name] | cue <event> | cues | playlists | playlist <name> [now] | import <url> [folder] | imports | spotify | ytdlp | listeners | check [all|<playlist>] | export <playlist> [sequential|random] [nobumpers] | exports | fx | intros | hourly [play [hour]] | process | reload | stop',
   };
   process.stdin.on('data', chunk => {
     for (const line of chunk.toString().split(/\r?\n/)) {

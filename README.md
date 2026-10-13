@@ -79,6 +79,12 @@ name appears on the web page, in `/now.json` as `playlist.display`, in `/now.txt
 `PLAYLIST_ORDER` in `.env` are only the defaults before anything has been chosen;
 `playlist reset` deletes the saved state and returns to them.
 
+**Starting part-way in.** `jump <song>` drops you at a chosen point and runs on in order:
+it switches the playlist to sequential, parks the cursor just before that song, and plays it.
+`jump <song> next` does the same but lets the current track finish. Use it to pick up a
+Halloween set at the track you want rather than from the top. (`play <song>` is different —
+a one-off request, after which sequential carries on from wherever it was.)
+
 **Order.** `random` (the default) reshuffles the pool each cycle. `sequential` follows the
 folder's `order.txt` if there is one, and otherwise natural filename order (`track2` before
 `track10`), then loops.
@@ -129,6 +135,99 @@ HTTP: `POST /import?token=…&url=…&folder=…[&limit=N]`.
 - If YouTube blocks the server's IP ("Sign in to confirm you're not a bot"), export cookies
   from a logged-in browser to a file and set `YTDLP_COOKIES=/home/container/cookies.txt`.
 - Downloads run one at a time at low priority; expect ~10 s per track.
+
+### Cues: world events synced to the audio (`intros/cues/`)
+
+A cue is a clip that, when it airs, tells the world exactly when listeners will hear it —
+so an animation in VRChat can land on the moment.
+
+There are two ways to mark one, depending on whether the clip already plays by itself.
+
+**A clip that already plays on its own** — a song intro, a bumper, an hourly check — is
+tagged by path in `cues.json` next to the server:
+
+```json
+{ "intros/songs/Living Dead Girl.mp3": "hijack" }
+```
+
+Whenever that clip airs, for whatever reason, the cue fires. Paths are relative to the
+server folder; slashes, case and a leading `./` do not matter. The file is re-read when it
+changes, so no restart.
+
+**Offset.** The cue fires at the *start* of the clip unless you say otherwise. If the moment
+you want is a few seconds in — the glitch rather than the first word — use the long form:
+
+```json
+{ "intros/songs/Living Dead Girl.mp3": { "event": "hijack", "offset": 3.5 } }
+```
+
+Putting the offset here rather than in each Unity script means every receiver — animators,
+blackout, anything you add later — lands on the same instant, and you can retune it by
+editing one file with no rebuild and no restart.
+
+**A clip you fire by hand** goes in its own folder:
+
+```
+intros/cues/hijack/interference.mp3     one or more clips; a random one is used
+```
+
+```
+cues              list both kinds
+cue hijack        play a folder clip at the next break, like `bumper`
+```
+or `POST /cue?token=…&event=hijack`. Clips in `intros/cues/` sit outside `intros/generic/`,
+so they are never picked at random — they only play when you ask.
+
+**How the sync works.** Polling can never be tight enough: VRChat allows one string
+download every 5 seconds. So the world does not react to the cue, it *schedules* it. When
+the clip hits the encoder, listeners will not hear it for another ~24 s (the HLS delay), and
+`/now.txt?delay=hls` spends that time reporting:
+
+```
+cue=hijack
+cueId=m2k4j1-hijack        unique per airing, so a client fires once
+cueIn=13.19                seconds until THIS listener hears it start
+```
+
+`cueIn` counts down in the listener's own timeline and goes negative once it has begun.
+`udon/StarlightNowPlaying.cs` takes that number, subtracts half the request round-trip, and
+calls `SendCustomEventDelayedSeconds` — so the trigger fires on a local timer, accurate to
+a fraction of a second, with no further requests. Every client computes from the same
+countdown, so they fire together *and* in time with the audio each one is hearing. Nothing
+is networked between players, so there is no owner, no late-joiner drift, and no VRChat
+sync budget used.
+
+**Several cues, different reactions.** There must only ever be **one** `StarlightNowPlaying`
+in the world — each instance polls, and VRChat allows one string download every 5 seconds
+per world. So the single poller fans out to receivers, and each receiver decides whether the
+cue is its own: before calling the event it sets a `radioCue` field on each target, and
+every receiver has an `onlyCueNamed` of its own. Leave the poller's own `onlyCueNamed`
+empty and filter per receiver.
+
+`udon/RadioCueAnimator.cs` is the drop-in for that: one per cue event, each with its own
+`onlyCueNamed`, a list of `animators` and a trigger (plus an optional `delaySeconds` to
+stagger receivers off one moment). List them all in the poller's `cueTargets`.
+
+The poller's own `cueAnimators` list is simpler but unfiltered — it fires on every cue that
+gets past the poller's gate, so it only suits a world with one cue.
+
+Two ready-made receivers ship in `udon/`:
+
+`udon/HijackFade.cs` — one small sphere that follows the local player's head, black out
+instantly then fade back. One object and one material change per frame while fading, nothing
+at all when idle, and it covers the skybox. This is the cheap one, and usually the one you
+want.
+
+`udon/HijackBlackout.cs` is the other look: 
+it swaps every renderer under the roots you give it to one flat **unlit** material and back,
+so the world becomes silhouettes rather than simply dark.
+Udon cannot touch lightmaps at all — VRChat does not expose `LightmapSettings` — but an
+unlit shader never samples them, so the swap gets the same silhouette effect. `toggleTimes`
+drives a flicker pattern, and `showWhileBlack` switches on objects for the duration, which
+is how you cover the skybox (a material swap cannot touch it). `restoreSeconds` brings the
+renderers back a few at a time so the world does not snap back in one frame. It costs a
+material swap per renderer, so for a big world prefer `HijackFade`. Someone who joins after the moment has passed gets a negative
+`cueIn` and correctly does not fire.
 
 ### Top-of-hour time checks (`intros/hourly/`)
 
@@ -279,7 +378,9 @@ Console commands (type into the Pterodactyl console or the terminal):
 | | |
 |---|---|
 | `skip` | next track |
+| `cue <event>` / `cues` | fire a world-synced cue clip (see Cues) |
 | `bumper` / `bumper <name>` | play a random / specific generic bumper at the next break, in place of that break's bumper |
+| `jump <song>` / `jump <song> next` | start sequential playback at that song and carry on in order from there; switches to sequential (and to that song's playlist) automatically. `next` waits for the current track instead of cutting |
 | `play <song>` / `play <song> now` | queue a specific song next (with its intro/bumper) or cut to it now; matches any words in the file name across all playlists, lists candidates if ambiguous |
 | `seek +30` / `seek -10` | jump forward / back within the current track |
 | `seek 90` / `seek 1:30` | jump to an absolute position |
@@ -376,8 +477,8 @@ $env:STATION_NAME="Fennia FM"; $env:ADMIN_TOKEN="changeme"; $env:HLS="1"; node n
 ## Now playing in the world (Udon)
 
 `GET /now.txt` returns flat `key=value` lines — `station`, `kind`, `artist`, `title`,
-`display`, `position`, `duration`, `next`, `playlist`, `playlistId`, `listeners`, `delay`,
-`serverTime` — which Udon
+`display`, `position`, `duration`, `next`, `playlist`, `playlistId`, `cue`, `cueId`,
+`cueIn`, `listeners`, `delay`, `serverTime` — which Udon
 can parse without a JSON step. `udon/StarlightNowPlaying.cs` is a ready UdonSharp script:
 drop it on a GameObject, set the URL, assign TextMeshPro fields.
 

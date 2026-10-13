@@ -50,6 +50,17 @@ public class StarlightNowPlaying : UdonSharpBehaviour
     [Header("Text shown when a bumper or station ID is playing")]
     public string bumperLabel = "Starlight Radio";
 
+    [Header("Cues (synced world events)")]
+    [Tooltip("Animators to trigger when a cue fires. Add as many props as you like.")]
+    public Animator[] cueAnimators;
+    [Tooltip("Trigger parameter name, the same on every animator listed above.")]
+    public string cueAnimatorTrigger = "RadioCue";
+    [Tooltip("Behaviours to notify as well as / instead of the animators.")]
+    public UdonSharpBehaviour[] cueTargets;
+    public string cueTargetEvent = "OnRadioCue";
+    [Tooltip("Optional global gate: ignore every cue except this one. Normally leave it EMPTY and let each receiver pick its own cue, so one poller can serve them all.")]
+    public string onlyCueNamed = "";
+
     [Header("Long titles")]
     [Tooltip("Optional marquee for long titles. Leave off if the TextMeshPro component already handles overflow.")]
     public bool scrollLongTitles = false;
@@ -61,6 +72,9 @@ public class StarlightNowPlaying : UdonSharpBehaviour
 
     private string _displayFull = "";
     private string _scrollSource = "";
+    private string _lastCueId = "";
+    private string _pendingCueName = "";
+    private float _requestStart;
     private float _position;
     private float _duration;
     private float _positionAtTime;         // Time.time when _position was received
@@ -80,6 +94,7 @@ public class StarlightNowPlaying : UdonSharpBehaviour
         }
         else
         {
+            _requestStart = Time.time;
             VRCStringDownloader.LoadUrl(url, (IUdonEventReceiver)this);
         }
         SendCustomEventDelayedSeconds(nameof(Poll), pollSeconds);
@@ -105,6 +120,10 @@ public class StarlightNowPlaying : UdonSharpBehaviour
         string next = "";
         string listeners = "";
         string playlist = "";
+        string cueName = "";
+        string cueId = "";
+        float cueIn = 0f;
+        bool haveCueIn = false;
         float position = 0f;
         float duration = 0f;
 
@@ -125,6 +144,9 @@ public class StarlightNowPlaying : UdonSharpBehaviour
             else if (key == "next") next = value;
             else if (key == "listeners") listeners = value;
             else if (key == "playlist") playlist = value;
+            else if (key == "cue") cueName = value;
+            else if (key == "cueId") cueId = value;
+            else if (key == "cueIn") haveCueIn = float.TryParse(value, out cueIn);
             else if (key == "position") float.TryParse(value, out position);
             else if (key == "duration") float.TryParse(value, out duration);
         }
@@ -143,7 +165,60 @@ public class StarlightNowPlaying : UdonSharpBehaviour
         SetText(nextText, next.Length > 0 ? "Up next: " + next : "");
         SetText(listenersText, listeners.Length > 0 ? listeners + " listening" : "");
         SetText(playlistText, playlist);
+        HandleCue(cueName, cueId, cueIn, haveCueIn);
         UpdateProgress();
+    }
+
+    // The server reports a cue before anyone hears it, counting down in listener time.
+    // Each client schedules its own timer off that number, so everyone fires together and
+    // in time with the audio they are actually hearing. Polling alone could never be
+    // tight enough (one request per 5 s), which is why this schedules rather than reacts.
+    private void HandleCue(string cueName, string cueId, float cueIn, bool haveCueIn)
+    {
+        if (cueId.Length == 0 || cueId == _lastCueId) return;          // nothing new
+        if (onlyCueNamed.Length > 0 && cueName != onlyCueNamed) return;
+        _lastCueId = cueId;                                            // claim it either way
+        if (!haveCueIn) return;
+
+        // Half the round trip is the server's view aging on the way to us.
+        float latency = Mathf.Clamp((Time.time - _requestStart) * 0.5f, 0f, 2f);
+        float wait = cueIn - latency;
+        if (wait <= 0f)
+        {
+            Debug.Log("[NowPlaying] cue '" + cueName + "' already passed (" + cueIn + "s), skipping");
+            return;
+        }
+        _pendingCueName = cueName;
+        SendCustomEventDelayedSeconds(nameof(FireCue), wait);
+        Debug.Log("[NowPlaying] cue '" + cueName + "' scheduled in " + wait + "s");
+    }
+
+    public void FireCue()
+    {
+        int animators = 0;
+        if (cueAnimators != null && cueAnimatorTrigger.Length > 0)
+        {
+            for (int i = 0; i < cueAnimators.Length; i++)
+            {
+                if (cueAnimators[i] == null) continue;
+                cueAnimators[i].SetTrigger(cueAnimatorTrigger);
+                animators++;
+            }
+        }
+        int targets = 0;
+        if (cueTargets != null && cueTargetEvent.Length > 0)
+        {
+            for (int i = 0; i < cueTargets.Length; i++)
+            {
+                if (cueTargets[i] == null) continue;
+                // Hand the receiver the cue name so it can decide for itself. A receiver
+                // without a `radioCue` field simply ignores this.
+                cueTargets[i].SetProgramVariable("radioCue", _pendingCueName);
+                cueTargets[i].SendCustomEvent(cueTargetEvent);
+                targets++;
+            }
+        }
+        Debug.Log("[NowPlaying] cue '" + _pendingCueName + "' fired -> " + animators + " animators, " + targets + " behaviours");
     }
 
     void Update()
