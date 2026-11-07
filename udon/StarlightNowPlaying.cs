@@ -70,6 +70,11 @@ public class StarlightNowPlaying : UdonSharpBehaviour
     [Tooltip("Separator shown between the end and the start while scrolling.")]
     public string scrollSeparator = "   ---   ";
 
+    [Header("Supporter board")]
+    [Tooltip("Optional. Gets the donor lines from each poll, so the board needs no requests of its own.")]
+    public StarlightDonorBoard donorBoard;
+
+    private string _lastDonors = "";
     private string _displayFull = "";
     private string _scrollSource = "";
     private string _lastCueId = "";
@@ -126,6 +131,7 @@ public class StarlightNowPlaying : UdonSharpBehaviour
         bool haveCueIn = false;
         float position = 0f;
         float duration = 0f;
+        string donors = "";
 
         string[] lines = body.Split('\n');
         for (int i = 0; i < lines.Length; i++)
@@ -149,6 +155,7 @@ public class StarlightNowPlaying : UdonSharpBehaviour
             else if (key == "cueIn") haveCueIn = float.TryParse(value, out cueIn);
             else if (key == "position") float.TryParse(value, out position);
             else if (key == "duration") float.TryParse(value, out duration);
+            else if (key.StartsWith("donor")) donors += line + "\n";
         }
 
         bool isSong = kind == "song";
@@ -167,6 +174,12 @@ public class StarlightNowPlaying : UdonSharpBehaviour
         SetText(playlistText, playlist);
         HandleCue(cueName, cueId, cueIn, haveCueIn);
         UpdateProgress();
+
+        if (donorBoard != null && donors != _lastDonors)
+        {
+            _lastDonors = donors;
+            donorBoard.ShowDonors(donors);
+        }
     }
 
     // The server reports a cue before anyone hears it, counting down in listener time.

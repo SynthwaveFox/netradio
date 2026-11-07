@@ -368,6 +368,7 @@ Then:
 | `http://host:3722/now.json` | current track, position, duration, next up, listener count |
 | `http://host:3722/now.txt` | the same as flat `key=value` lines, for VRChat/Udon (see below) |
 | `http://host:3722/history.json` | last 50 tracks |
+| `POST /kofi/webhook` | Ko-fi payments for the supporter board (see below) |
 | `POST /skip?token=…` | skip current track (needs `ADMIN_TOKEN`) |
 | `POST /play?token=…&q=fireflies[&now=1]` | queue / play a specific song |
 | `POST /seek?token=…&by=30` / `&by=-10` / `&to=90` | seek within the current track, relative or absolute seconds |
@@ -474,11 +475,41 @@ $env:STATION_NAME="Fennia FM"; $env:ADMIN_TOKEN="changeme"; $env:HLS="1"; node n
 4. Once it works, put it behind the same domain/TLS as the CDN so Quest users (https only)
    can tune in, then set `PUBLIC_URL` accordingly.
 
+## Supporter board (Ko-fi)
+
+`/now.txt` also carries the top supporters as `donor1=50.00|Name` lines, so the world's board
+needs no request of its own. Amount first, so a `|` in a name cannot break the line. Older
+world builds ignore these lines.
+
+Ko-fi has no read API: it only POSTs each new payment to a webhook. `donors.mjs` adds those up
+in `donors-state.json`, and history comes from one import of Ko-fi's Supporters CSV.
+
+1. Set `KOFI_VERIFICATION_TOKEN` (from ko-fi.com/manage/webhooks), `DONOR_HASH_KEY` and
+   `KOFI_DRY_RUN=1` in `.env`, deploy, and set the webhook URL to
+   `<PUBLIC_URL>/kofi/webhook`. Send a test from Ko-fi and check the console logged it.
+2. Export the Supporters CSV and, on your own machine, run
+   `DONOR_HASH_KEY=<same key> node tools/donors-seed.mjs Supporters.csv`. Upload only the
+   resulting `donors-state.json`, next to `netradio.js`. Emails in it are keyed hashes.
+3. Remove `KOFI_DRY_RUN` and restart.
+
+Rules:
+- One person's payments add up by email hash. Someone paying from a second email is a new row.
+- `is_public=false` payments are not counted at all.
+- `DONOR_HIDDEN_NAMES` (default `Ko-fi Supporter`) rows are counted but never published. Add a
+  name here to take someone off the board.
+- Only `DONOR_COUNTED_TYPES` count (default tips and memberships, not shop or commissions).
+- Payments not in `DONOR_CURRENCY` go to `unconverted` in the state file instead of the total.
+- Ties rank whoever reached that total first higher.
+- Published names are cut to what the world's font can draw (plain ASCII, no `<` `>`, 20
+  characters). A name with nothing left is counted but not shown.
+- Ko-fi refunds do not arrive as a webhook as far as we know: correct `cents` in the state file
+  by hand, with the server stopped.
+
 ## Now playing in the world (Udon)
 
 `GET /now.txt` returns flat `key=value` lines — `station`, `kind`, `artist`, `title`,
 `display`, `position`, `duration`, `next`, `playlist`, `playlistId`, `cue`, `cueId`,
-`cueIn`, `listeners`, `delay`, `serverTime` — which Udon
+`cueIn`, `listeners`, `delay`, `serverTime`, plus `donorN` — which Udon
 can parse without a JSON step. `udon/StarlightNowPlaying.cs` is a ready UdonSharp script:
 drop it on a GameObject, set the URL, assign TextMeshPro fields.
 

@@ -7,6 +7,9 @@ songs*
 loudness-cache.json
 hourly-state.json
 spotify-auth.json
+donors-state.json
+donors-state.json.tmp
+Supporters_*.csv
 bin/
 hls/
 

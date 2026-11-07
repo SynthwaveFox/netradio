@@ -14,6 +14,7 @@
 //   GET  /            tiny web player + now-playing page
 //   GET  /health      "ok"
 //   GET  /hls/live.m3u8  HLS mirror of the same stream — use this URL in VRChat (HLS=0 disables)
+//   POST /kofi/webhook Ko-fi payments, for the supporter board in /now.txt (see donors.mjs)
 //   POST /skip?token=  skip current track (ADMIN_TOKEN must be set)
 //   POST /seek?token=&by=30 | &to=90   seek within the current track
 //   POST /reload?token= rescan the library
@@ -116,6 +117,18 @@ const CONFIG = {
   hlsKeepSegments: Number(process.env.HLS_KEEP_SEGMENTS || 15),     // extra expired segments kept on disk for players that fell behind
 
   adminToken: process.env.ADMIN_TOKEN || '',
+
+  donors: {
+    verificationToken: process.env.KOFI_VERIFICATION_TOKEN || '',
+    hashKey: process.env.DONOR_HASH_KEY || '',                     // keys the email hashes; changing it splits everyone's totals
+    dryRun: process.env.KOFI_DRY_RUN === '1',                      // log webhooks but save nothing, for the first test
+    currency: (process.env.DONOR_CURRENCY || 'USD').toUpperCase(), // totals are in this; anything else is kept aside, not added
+    countedTypes: (process.env.DONOR_COUNTED_TYPES || 'Donation,Subscription').split(','),
+    hiddenNames: (process.env.DONOR_HIDDEN_NAMES || 'Ko-fi Supporter').split(','), // counted, but never published
+    boardSize: Number(process.env.DONOR_BOARD_SIZE || 10),
+    stateFile: process.env.DONORS_FILE || path.join(__dirname, 'donors-state.json'),
+  },
+
   exportsDir: process.env.EXPORTS_DIR || path.join(__dirname, 'exports'), // archive renders (not part of the stream)
 
   // Raw bumper processing (see RawProcessor): intros/raw -> intros/generic
@@ -2210,7 +2223,7 @@ function requestedDelay(url, playout) {
 }
 
 // Flat key=value lines: what Udon (VRCStringDownloader) can parse without a JSON step.
-function nowPlayingText(playout, broadcaster, hlsAudience, delay) {
+function nowPlayingText(playout, broadcaster, hlsAudience, donors, delay) {
   const st = playout.status(delay);
   const n = st.now;
   const lines = [
@@ -2230,6 +2243,7 @@ function nowPlayingText(playout, broadcaster, hlsAudience, delay) {
     `listeners=${broadcaster.listeners.size + hlsAudience.size}`,
     `delay=${delay}`,
     `serverTime=${Math.round(Date.now() / 1000)}`,
+    ...(donors ? donors.lines() : []),
   ];
   // Values must not contain newlines, or the line format breaks.
   return lines.map(l => l.replace(/[\r\n]+/g, ' ')).join(String.fromCharCode(10)) + String.fromCharCode(10);
@@ -2483,7 +2497,7 @@ function authorized(url) {
   return CONFIG.adminToken && url.searchParams.get('token') === CONFIG.adminToken;
 }
 
-function createServer(playout, broadcaster, importer, hlsAudience, exporter) {
+function createServer(playout, broadcaster, importer, hlsAudience, exporter, donors) {
   const server = http.createServer((req, res) => {
     let url;
     try {
@@ -2508,7 +2522,7 @@ function createServer(playout, broadcaster, importer, hlsAudience, exporter) {
     }
 
     if (p === '/now.txt') {
-      return sendText(req, res, 200, nowPlayingText(playout, broadcaster, hlsAudience, requestedDelay(url, playout)));
+      return sendText(req, res, 200, nowPlayingText(playout, broadcaster, hlsAudience, donors, requestedDelay(url, playout)));
     }
 
     if (p === '/now.json' || p === '/status.json') {
@@ -2525,6 +2539,8 @@ function createServer(playout, broadcaster, importer, hlsAudience, exporter) {
         burstBufferKB: Math.round(broadcaster.ring.reduce((a, r) => a + r.buf.length, 0) / 1024),
       });
     }
+
+    if (donors && p === '/kofi/webhook') return donors.handleWebhook(req, res, sendText);
 
     if (p === '/history.json') return sendJson(req, res, 200, { history: playout.history });
     if (p === '/health') return sendText(req, res, 200, 'ok');
@@ -2642,6 +2658,14 @@ async function main() {
   } catch (e) {
     if (e.code !== 'ERR_MODULE_NOT_FOUND') logErr(`importer.mjs failed to load: ${e.message}`);
   }
+  // Optional supporter board (donors.mjs next to this file).
+  let donors = null;
+  try {
+    const mod = await import('./donors.mjs');
+    donors = mod.createDonors({ CONFIG, logInfo, logWarn, logErr });
+  } catch (e) {
+    if (e.code !== 'ERR_MODULE_NOT_FOUND') logErr(`donors.mjs failed to load: ${e.message}`);
+  }
   const NO_IMPORTER = 'playlist import not installed: upload importer.mjs next to netradio.js';
   await rawProcessor.start();
   const encoder = new Encoder();
@@ -2650,7 +2674,7 @@ async function main() {
   const hlsAudience = new HlsAudience();
   encoder.on('data', chunk => broadcaster.onEncoded(chunk));
 
-  const server = createServer(playout, broadcaster, importer, hlsAudience, exporter);
+  const server = createServer(playout, broadcaster, importer, hlsAudience, exporter, donors);
   server.on('error', err => {
     logErr(`http server error: ${err.message}`);
     process.exit(1);
