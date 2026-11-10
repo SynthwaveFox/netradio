@@ -375,45 +375,56 @@ class Importer {
 
   async findOnYouTube(track) {
     const want = looseTitle(track.title);
-    const wantArtist = normalizeName(track.artist.split(',')[0]);
-    const q = encodeURIComponent(`${track.artist.split(',')[0]} ${track.title}`);
+    const firstArtist = track.artist.split(',')[0];
+    const artistWords = normalizeName(firstArtist).split('-').filter(Boolean);
+    // Any order, so "Utada Hikaru" is still Hikaru Utada.
+    const hasArtist = text => { const t = ` ${normalizeName(text).replace(/-/g, ' ')} `; return artistWords.every(w => t.includes(` ${w} `)); };
+    // "Song - Somebody Remix": the remixer has to be named, or any remix of the song would do.
+    const remixer = /([^-()[\]]+?)\s+(?:remix|rework|bootleg|flip)\b/i.exec(track.title.replace(/^[^-([]*/, ''));
+    const remixWords = remixer ? normalizeName(remixer[1]).split('-').filter(Boolean) : [];
     const seen = new Set();
-    const candidates = [];
+
+    const pick = async candidates => {
+      for (const c of candidates) {
+        const ct = looseTitle(c.title);
+        const titleOk = ct.includes(want) || want.includes(ct);
+        if (!titleOk) continue;
+        if (badWordsIn(c.title, track.title).length) continue;
+        const flatTitle = ` ${normalizeName(c.title).replace(/-/g, ' ')} `;
+        if (!remixWords.every(w => flatTitle.includes(` ${w} `))) continue;
+        if (track.durationSec && c.duration && Math.abs(c.duration - track.durationSec) > 12) continue;
+        // verify with full metadata (duration, artist, album)
+        let meta;
+        try { [meta] = await this.ytdlp.jsonLines(['-j', '--no-download', `https://www.youtube.com/watch?v=${c.id}`], { timeout: 60000 }); } catch (e) { logWarn(`lookup failed for ${c.id}: ${e.message}`); continue; }
+        if (!meta) continue;
+        const dur = meta.duration || c.duration;
+        if (track.durationSec && dur && Math.abs(dur - track.durationSec) > 12) continue;
+        const channel = `${meta.channel || ''} ${meta.uploader || ''} ${meta.artist || ''}`;
+        if (artistWords.length && !hasArtist(channel) && !hasArtist(meta.title || '')) {
+          // artist not mentioned anywhere: only accept if the duration matched tightly
+          if (!(track.durationSec && dur && Math.abs(dur - track.durationSec) <= 3)) continue;
+        }
+        return { id: c.id, duration: dur, album: meta.album || '', year: meta.release_year || '' };
+      }
+      return null;
+    };
+    const search = async (label, args, extra = () => ({})) => {
+      const found = [];
+      try {
+        for (const e of await this.ytdlp.jsonLines(args, { timeout: 60000 })) {
+          if (e.id && !seen.has(e.id)) { seen.add(e.id); found.push({ id: e.id, title: e.title || '', ...extra(e) }); }
+        }
+      } catch (e) { logWarn(`${label} failed: ${e.message}`); }
+      return found;
+    };
 
     // 1. YouTube Music "songs" results (audio-only, properly tagged)
-    try {
-      for (const e of await this.ytdlp.jsonLines(['--flat-playlist', '--playlist-end', '5', '-j', `https://music.youtube.com/search?q=${q}#songs`], { timeout: 60000 })) {
-        if (e.id && !seen.has(e.id)) { seen.add(e.id); candidates.push({ id: e.id, title: e.title || '' }); }
-      }
-    } catch (e) { logWarn(`youtube music search failed: ${e.message}`); }
-    // 2. plain YouTube search as a fallback (durations available up front)
-    if (candidates.length < 3) {
-      try {
-        for (const e of await this.ytdlp.jsonLines(['--flat-playlist', '-j', `ytsearch5:${track.artist.split(',')[0]} - ${track.title}`], { timeout: 60000 })) {
-          if (e.id && !seen.has(e.id)) { seen.add(e.id); candidates.push({ id: e.id, title: e.title || '', duration: e.duration, channel: e.channel || e.uploader || '' }); }
-        }
-      } catch (e) { logWarn(`youtube search failed: ${e.message}`); }
-    }
-
-    for (const c of candidates) {
-      const ct = looseTitle(c.title);
-      const titleOk = ct.includes(want) || want.includes(ct);
-      if (!titleOk) continue;
-      if (badWordsIn(c.title, track.title).length) continue;
-      // verify with full metadata (duration, artist, album)
-      let meta;
-      try { [meta] = await this.ytdlp.jsonLines(['-j', '--no-download', `https://www.youtube.com/watch?v=${c.id}`], { timeout: 60000 }); } catch (e) { logWarn(`lookup failed for ${c.id}: ${e.message}`); continue; }
-      if (!meta) continue;
-      const dur = meta.duration || c.duration;
-      if (track.durationSec && dur && Math.abs(dur - track.durationSec) > 12) continue;
-      const channel = `${meta.channel || ''} ${meta.uploader || ''} ${meta.artist || ''}`;
-      if (wantArtist && !normalizeName(channel).includes(wantArtist) && !normalizeName(meta.title || '').includes(wantArtist)) {
-        // artist not mentioned anywhere: only accept if the duration matched tightly
-        if (!(track.durationSec && dur && Math.abs(dur - track.durationSec) <= 3)) continue;
-      }
-      return { id: c.id, duration: dur, album: meta.album || '', year: meta.release_year || '' };
-    }
-    return null;
+    const q = encodeURIComponent(`${firstArtist} ${track.title}`);
+    const hit = await pick(await search('youtube music search', ['--flat-playlist', '--playlist-end', '5', '-j', `https://music.youtube.com/search?q=${q}#songs`]));
+    if (hit) return hit;
+    // 2. Plain YouTube search whenever none of those fit, not only when there were few of
+    // them: for a remix or a long version the songs results are often five other cuts.
+    return pick(await search('youtube search', ['--flat-playlist', '-j', `ytsearch5:${firstArtist} - ${track.title}`], e => ({ duration: e.duration })));
   }
 
   async download(track, videoId, dir, extra = {}) {
