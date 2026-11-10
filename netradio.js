@@ -1449,6 +1449,11 @@ class Playout extends EventEmitter {
 
   status(delay = 0) {
     const nextSong = this.pending.find(t => t.kind === 'song');
+    // What is queued, then what the scheduler would pick after that.
+    const ahead = [
+      ...this.pending.filter(t => t.kind === 'song').map(t => t.displayTitle),
+      ...this.scheduler.peekUpcoming(5).map(f => parseSongInfo(f)).map(p => (p.artist ? `${p.artist} - ${p.title}` : p.title)),
+    ];
     if (delay > 0) {
       const nowItem = this.playingAgo(delay);
       return {
@@ -1460,8 +1465,9 @@ class Playout extends EventEmitter {
         playlist: this.scheduler.playlistInfo(),
         cue: this.cueInfo(delay),
         upcoming: [
-          ...(this.current && (!nowItem || nowItem.file !== path.basename(this.current.file)) ? [this.current.displayTitle] : []),
-          ...this.pending.filter(t => t.kind === 'song').map(t => t.displayTitle),
+          // a delayed listener has not reached the current song yet, so for them it is still to come
+          ...(this.current && this.current.kind === 'song' && (!nowItem || nowItem.file !== path.basename(this.current.file)) ? [this.current.displayTitle] : []),
+          ...ahead,
         ].slice(0, 5),
         serverTime: new Date().toISOString(),
         uptime: Math.round((Date.now() - this.startedAt.getTime()) / 1000),
@@ -1476,10 +1482,7 @@ class Playout extends EventEmitter {
       next: nextSong ? { kind: nextSong.kind, display: nextSong.displayTitle, file: path.basename(nextSong.file) } : null,
       playlist: this.scheduler.playlistInfo(),
       cue: this.cueInfo(delay),
-      upcoming: [
-        ...this.pending.filter(t => t.kind === 'song').map(t => t.displayTitle),
-        ...this.scheduler.peekUpcoming(5).map(f => parseSongInfo(f)).map(p => (p.artist ? `${p.artist} - ${p.title}` : p.title)),
-      ].slice(0, 5),
+      upcoming: ahead.slice(0, 5),
       serverTime: new Date().toISOString(),
       uptime: Math.round((Date.now() - this.startedAt.getTime()) / 1000),
       underruns: this.underruns,
