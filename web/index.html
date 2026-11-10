@@ -369,7 +369,10 @@ const fmt = s => { s = Math.max(0, Math.floor(s)); return String(Math.floor(s / 
 const player = $('player');
 let hls = null, lag = R.hls ? R.segmentSeconds * 3 : 0;
 function attachStream() {
-  if (R.hls && window.Hls && Hls.isSupported()) {
+  // HLS only where hls.js can run on real Media Source Extensions. iPhones have none, and
+  // their own HLS player hands Web Audio nothing but silence, which leaves the meters dead,
+  // so there (and anywhere else without MSE) the page plays the MP3 mount instead.
+  if (R.hls && window.Hls && window.MediaSource && Hls.isSupported()) {
     hls = new Hls({ liveSyncDurationCount: 3, backBufferLength: 30 });
     hls.loadSource('/hls/live.m3u8'); hls.attachMedia(player);
     // A fatal error would otherwise leave the page deaf until a reload: the playlist is
@@ -380,7 +383,6 @@ function attachStream() {
       else setTimeout(() => { hls.loadSource('/hls/live.m3u8'); }, 3000);
     });
   }
-  else if (R.hls && player.canPlayType('application/vnd.apple.mpegurl')) { player.src = '/hls/live.m3u8'; }
   else { player.src = R.mount; lag = 0; }
 }
 // ?trim=N adds N seconds to the measured lag (the playlist's PROGRAM-DATE-TIME is anchored
@@ -550,7 +552,10 @@ const FMIN = 45, FMAX = 16000, MAXBARS = 96;
 const bank = () => ({ v: new Float32Array(MAXBARS), p: new Float32Array(MAXBARS), hold: new Float32Array(MAXBARS) });
 const bMix = bank(), bL = bank(), bR = bank();
 let fMix = null, fL = null, fR = null, tMix = null, tL = null, tR = null;
-const isLive = () => !!(actx && anMix && !player.paused);
+// Some browsers play a stream fine but give the analysers only zeros. After a few seconds
+// of that the modes go back to idling rather than sitting dark; real audio brings them back.
+let deadFor = 0;
+const isLive = () => !!(actx && anMix && !player.paused && deadFor < 4);
 
 // Log-spaced bars with meter ballistics: quick up, steady fall, and a peak cap that hangs.
 function fillBank(b, an, buf, n, dt, t, phase) {
@@ -761,11 +766,16 @@ function frame(ts) {
   requestAnimationFrame(frame);
   if (!W) return;
   const dt = Math.min(0.1, (ts - lastTs) / 1000 || 0.016); lastTs = ts;
-  const t = ts / 1000, live = isLive();
-  if (live && !fMix) {
+  const t = ts / 1000;
+  if (actx && anMix && !fMix) {
     fMix = new Uint8Array(anMix.frequencyBinCount); fL = new Uint8Array(anL.frequencyBinCount); fR = new Uint8Array(anR.frequencyBinCount);
     tMix = new Float32Array(anMix.fftSize); tL = new Float32Array(anL.fftSize); tR = new Float32Array(anR.fftSize);
   }
+  if (fMix && !player.paused) {
+    anMix.getByteFrequencyData(fMix);
+    deadFor = fMix.some(v => v > 0) ? 0 : deadFor + dt;
+  } else deadFor = 0;
+  const live = isLive();
   if (MODES[mode].persist) {
     lg.globalCompositeOperation = 'destination-out'; lg.fillStyle = 'rgba(0,0,0,0.3)'; lg.fillRect(0, 0, W, H); lg.globalCompositeOperation = 'source-over';
   } else lg.clearRect(0, 0, W, H);
