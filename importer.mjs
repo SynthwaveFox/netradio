@@ -383,26 +383,31 @@ class Importer {
     const remixer = /([^-()[\]]+?)\s+(?:remix|rework|bootleg|flip)\b/i.exec(track.title.replace(/^[^-([]*/, ''));
     const remixWords = remixer ? normalizeName(remixer[1]).split('-').filter(Boolean) : [];
     const seen = new Set();
+    // Why each near miss was turned down, for the log when nothing is accepted.
+    const mmss = s => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
+    this.lastRejects = [];
+    const reject = (c, dur, why) => { this.lastRejects.push(`"${c.title}"${dur ? ` ${mmss(dur)}` : ''} (${why})`); };
 
     const pick = async candidates => {
       for (const c of candidates) {
         const ct = looseTitle(c.title);
         const titleOk = ct.includes(want) || want.includes(ct);
         if (!titleOk) continue;
-        if (badWordsIn(c.title, track.title).length) continue;
+        const bad = badWordsIn(c.title, track.title);
+        if (bad.length) { reject(c, c.duration, bad.join(', ')); continue; }
         const flatTitle = ` ${normalizeName(c.title).replace(/-/g, ' ')} `;
-        if (!remixWords.every(w => flatTitle.includes(` ${w} `))) continue;
-        if (track.durationSec && c.duration && Math.abs(c.duration - track.durationSec) > 12) continue;
+        if (!remixWords.every(w => flatTitle.includes(` ${w} `))) { reject(c, c.duration, 'other remix'); continue; }
+        if (track.durationSec && c.duration && Math.abs(c.duration - track.durationSec) > 12) { reject(c, c.duration, 'length'); continue; }
         // verify with full metadata (duration, artist, album)
         let meta;
         try { [meta] = await this.ytdlp.jsonLines(['-j', '--no-download', `https://www.youtube.com/watch?v=${c.id}`], { timeout: 60000 }); } catch (e) { logWarn(`lookup failed for ${c.id}: ${e.message}`); continue; }
         if (!meta) continue;
         const dur = meta.duration || c.duration;
-        if (track.durationSec && dur && Math.abs(dur - track.durationSec) > 12) continue;
+        if (track.durationSec && dur && Math.abs(dur - track.durationSec) > 12) { reject(c, dur, 'length'); continue; }
         const channel = `${meta.channel || ''} ${meta.uploader || ''} ${meta.artist || ''}`;
         if (artistWords.length && !hasArtist(channel) && !hasArtist(meta.title || '')) {
           // artist not mentioned anywhere: only accept if the duration matched tightly
-          if (!(track.durationSec && dur && Math.abs(dur - track.durationSec) <= 3)) continue;
+          if (!(track.durationSec && dur && Math.abs(dur - track.durationSec) <= 3)) { reject(c, dur, 'artist not named'); continue; }
         }
         return { id: c.id, duration: dur, album: meta.album || '', year: meta.release_year || '' };
       }
@@ -510,7 +515,8 @@ class Importer {
         if (!match) {
           misses.push(label);
           this.current.failed += 1;
-          logWarn(`[import ${i + 1}/${todo.length}] no confident match: ${label}`);
+          logWarn(`[import ${i + 1}/${todo.length}] no confident match: ${label}${t.durationSec ? ` (${Math.floor(t.durationSec / 60)}:${String(Math.round(t.durationSec % 60)).padStart(2, '0')})` : ''}`);
+          logWarn(`    ${this.lastRejects.length ? `turned down: ${this.lastRejects.join('; ')}` : 'no search result had a matching title'}`);
           continue;
         }
         const file = await this.download(t, match.id, dir, match);
