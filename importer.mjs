@@ -43,6 +43,14 @@ function looseTitle(s) {
     .replace(/\s-\s(.*remaster.*|.*version.*|.*edit.*|.*mix.*)$/i, ''));
 }
 
+// The keys a track may be on disk under. The second is the name download() gives it: a long
+// "artist - title" is cut to fit a file name, which also cuts through any "(feat. ...)", so
+// that file's key matches neither of the other two.
+function trackKeys(t) {
+  const full = `${t.artist} - ${t.title}`;
+  return [looseTitle(full), looseTitle(safeFilename(full)), looseTitle(t.title)];
+}
+
 function badWordsIn(s, allowed) {
   const t = ` ${normalizeName(s).replace(/-/g, ' ')} `;
   const a = ` ${normalizeName(allowed).replace(/-/g, ' ')} `;
@@ -474,7 +482,7 @@ class Importer {
     const seen = new Set();
     let unresolved = 0;
     for (const t of tracks) {
-      const name = byKey.get(looseTitle(`${t.artist} - ${t.title}`)) || byKey.get(looseTitle(t.title));
+      const name = trackKeys(t).map(k => byKey.get(k)).find(Boolean);
       if (!name) { unresolved += 1; continue; }
       if (seen.has(name)) continue;
       seen.add(name);
@@ -502,7 +510,7 @@ class Importer {
     ensureDir(dir);
     const have = this.existingKeys(dir);
     if (job.limit > 0) src.tracks = src.tracks.slice(0, job.limit);
-    const todo = src.tracks.filter(t => t.title && !have.has(looseTitle(`${t.artist} - ${t.title}`)) && !have.has(looseTitle(t.title)));
+    const todo = src.tracks.filter(t => t.title && !trackKeys(t).some(k => have.has(k)));
     this.current.total = src.tracks.length;
     this.current.skipped = src.tracks.length - todo.length;
     logInfo(`import: "${src.name}" -> songs/${folder}: ${src.tracks.length} tracks, ${todo.length} to fetch, ${this.current.skipped} already present`);
