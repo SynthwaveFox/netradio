@@ -367,7 +367,8 @@ const fmt = s => { s = Math.max(0, Math.floor(s)); return String(Math.floor(s / 
 // This page sits much closer to the live edge than AVPro does, so it measures its own lag
 // from the stream's PROGRAM-DATE-TIME rather than assuming the AVPro figure.
 const player = $('player');
-let hls = null, lag = R.hls ? R.segmentSeconds * 3 : 0;
+const tuneInLag = R.hls ? R.segmentSeconds * 3 : 0;   // a fair guess until the first measurement
+let hls = null, lag = 0;
 function attachStream() {
   // HLS only where hls.js can run on real Media Source Extensions. iPhones have none, and
   // their own HLS player hands Web Audio nothing but silence, which leaves the meters dead,
@@ -395,6 +396,10 @@ const pdtCorrection = R.hls ? R.segmentSeconds : 0;
 let measured = null;
 function measure(serverTime) {
   try {
+    // Only while it is playing. A stopped player's position stands still while the server's
+    // clock runs on, so measuring then made the lag grow by the second and the display run
+    // backwards. With nothing to be in step with, show the station as it is right now.
+    if (player.paused) { measured = null; lag = 0; return; }
     if (!hls || !hls.playingDate) return;
     const d = (Date.parse(serverTime) - hls.playingDate.getTime()) / 1000;
     if (isFinite(d) && d >= 0 && d < 300) { measured = d; lag = d + pdtCorrection + trim; }
@@ -423,7 +428,17 @@ function initAudio() {
 const playBtn = $('playBtn'), stateEl = $('state'), vol = $('vol');
 function setState(text, idle) { stateEl.textContent = text; stateEl.classList.toggle('idle', !!idle); }
 function toggle() {
-  if (player.paused) { initAudio(); setState('TUNING'); player.play().catch(() => setState('STANDBY', true)); }
+  if (player.paused) {
+    initAudio(); setState('TUNING');
+    if (hls) {
+      lag = tuneInLag;
+      // Play means tune in live, not carry on from wherever the player was stopped.
+      const edge = hls.liveSyncPosition;
+      if (edge != null && isFinite(edge) && player.currentTime < edge - 1) player.currentTime = edge;
+    }
+    else player.src = R.mount;   // a fresh connection, or a paused MP3 would resume from its old buffer
+    player.play().catch(() => setState('STANDBY', true));
+  }
   else player.pause();
 }
 playBtn.onclick = toggle;
@@ -449,7 +464,7 @@ document.addEventListener('keydown', e => {
 // Now playing
 // ---------------------------------------------------------------------------
 const KIND_LABELS = { bumper: 'Station ID', intro: 'Intro', hourly: 'Time check', cue: 'Transmission' };
-let now = null, nowAt = 0, skew = 0, fails = 0, lastFile = null, lastCue = null;
+let now = null, nowAt = 0, skew = 0, fails = 0, lastFile, lastCue = null;   // lastFile starts undefined so the first poll always draws, even for silence
 
 function row(cls, n, t, a) {
   const li = document.createElement('li');
