@@ -1,0 +1,806 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#111111">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23111'/%3E%3Cpath fill='%23ff8a00' d='M2 9h2v5H2zM5 5h2v9H5zM8 7h2v7H8zM11 2h2v12h-2z'/%3E%3C/svg%3E">
+<title>%STATION%</title>
+<!--
+  The station's web player. netradio.js serves this file at / and swaps in two things:
+  %STATION% (the escaped station name) and the RADIO_CONFIG comment below (window.RADIO).
+  Look: the Hexnet theme from vrc-comms (orange #ff8a00 on near-black, Audiowide + B612),
+  the scanlined glass from fen-wiki, and pink/cyan kept for the hot end of the meters.
+-->
+<style>
+@font-face { font-family: 'Audiowide'; src: url('/web/fonts/audiowide.woff2') format('woff2'); font-display: swap; }
+@font-face { font-family: 'B612'; src: url('/web/fonts/b612-400.woff2') format('woff2'); font-weight: 400; font-display: swap; }
+@font-face { font-family: 'B612'; src: url('/web/fonts/b612-700.woff2') format('woff2'); font-weight: 700; font-display: swap; }
+@font-face { font-family: 'B612 Mono'; src: url('/web/fonts/b612-mono-400.woff2') format('woff2'); font-display: swap; }
+
+:root {
+  color-scheme: dark;
+  --orange: #ff8a00;
+  --amber: #ffc233;
+  --pink: #ff3d8b;
+  --cyan: #5ef1ff;
+  --peach: #fab387;
+  --ink: #171717;
+  --ink-2: #111111;
+  --glass: #0a0806;
+  --paper: #f2efe9;
+  --quiet: #a39c90;
+  --ghost: #ff8a0020;
+  --hairline: 1px solid #ff8a0055;
+  --display: 'Audiowide', sans-serif;
+  --body: 'B612', system-ui, sans-serif;
+  --mono: 'B612 Mono', ui-monospace, monospace;
+  --glow: 0 0 14px #ff8a0080;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; min-height: 100vh; color: var(--paper); font: 15px/1.5 var(--body);
+  background-color: var(--ink-2);
+  background-image:
+    radial-gradient(110% 55% at 50% 108%, #ff3d8b26, transparent 62%),
+    radial-gradient(80% 40% at 50% -10%, #ff8a0018, transparent 70%),
+    linear-gradient(#ff8a001c 1px, transparent 1px),
+    linear-gradient(90deg, #ff8a001c 1px, transparent 1px);
+  background-size: auto, auto, 88px 88px, 88px 88px;
+  background-position: 0 0, 0 0, -1px -1px, -1px -1px;
+  background-attachment: fixed;
+}
+button { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
+
+/* ---------- the unit ---------- */
+.rack {
+  container-type: inline-size; max-width: 1180px; margin: 14px auto; border: 3px solid var(--orange);
+  background: linear-gradient(180deg, #1c1c1c, var(--ink) 30%, #131313);
+  box-shadow: 0 0 60px #ff8a0022, 0 30px 80px #000a;
+}
+@media (max-width: 1210px) { .rack { margin: 14px; } }
+.pad { padding: clamp(14px, 2.6cqw, 28px); }
+.lbl { font: 11px/1 var(--mono); letter-spacing: .18em; text-transform: uppercase; color: var(--quiet); white-space: nowrap; }
+
+/* ---------- faceplate ---------- */
+.plate { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 28px; border-bottom: var(--hairline); }
+.brand { margin-right: auto; min-width: 0; }
+.logo {
+  display: inline-block; transform: skewX(-10deg); transform-origin: left bottom;
+  font: 400 clamp(26px, 5cqw, 46px)/1 var(--display); text-transform: uppercase; color: var(--paper); margin: 0;
+}
+.logo b { font-weight: 400; color: var(--orange); text-shadow: var(--glow); }
+.tag { display: block; margin-top: 8px; color: var(--quiet); font-size: 13px; }
+.status { display: flex; align-items: flex-end; gap: clamp(14px, 2.4cqw, 28px); }
+.readout { display: grid; gap: 7px; justify-items: end; }
+.readout .seg { font-size: 26px; }
+.lamp {
+  display: flex; align-items: center; gap: 9px; padding: 8px 12px; border: 1px solid #ff3d8b55;
+  font: 12px/1 var(--display); letter-spacing: .14em; color: #ff3d8b66; white-space: nowrap;
+}
+.lamp i { width: 9px; height: 9px; border-radius: 50%; background: #ff3d8b40; }
+.lamp.on { color: var(--pink); border-color: var(--pink); box-shadow: 0 0 18px #ff3d8b40, inset 0 0 12px #ff3d8b22; text-shadow: 0 0 10px #ff3d8b; }
+.lamp.on i { background: var(--pink); box-shadow: 0 0 10px var(--pink); animation: pulse 2.4s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .45; } }
+
+/* ---------- seven segment readouts ---------- */
+.seg { display: inline-flex; gap: .16em; height: 1em; transform: skewX(-6deg); filter: drop-shadow(0 0 5px #ff8a0090); }
+.seg svg { height: 1em; width: auto; display: block; }
+.seg .s0 { fill: #ff8a001c; }
+.seg .s1 { fill: var(--orange); }
+.seg.tick .colon .s1 { fill: #ff8a0040; }
+
+/* ---------- the glass ---------- */
+.glass {
+  position: relative; overflow: hidden; background: var(--glass); border: var(--hairline); border-radius: 6px;
+  box-shadow: inset 0 0 40px #000, inset 0 0 0 1px #000, 0 1px 0 #ffffff0d;
+}
+.glass::after { /* scanlines and a little glare, over everything in the window */
+  content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 5;
+  background:
+    linear-gradient(170deg, #ffffff0b, transparent 22%),
+    repeating-linear-gradient(to bottom, #0000004d 0 1px, transparent 1px 3px);
+}
+.glass > * { position: relative; }
+
+.np { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 24px; align-items: end; }
+.np-top { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 4px; }
+.np-top .lbl { color: var(--orange); }
+.chip { font: 11px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; padding: 5px 8px; border: var(--hairline); color: var(--peach); }
+.chip:empty { display: none; }
+.chip.hot { color: var(--glass); background: var(--pink); border-color: var(--pink); }
+.chip.right { margin-left: auto; }
+.title {
+  margin: 0; font: 400 clamp(22px, 3.9cqw, 42px)/1.12 var(--display); color: var(--orange); text-shadow: var(--glow);
+  text-wrap: balance; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.artist { margin: 6px 0 0; font-size: clamp(14px, 1.7cqw, 18px); color: var(--paper); min-height: 1.5em; overflow-wrap: anywhere; }
+.np.swap .title, .np.swap .artist { animation: tune .55s steps(6) 1; }
+@keyframes tune { 0% { opacity: 0; transform: translateX(-6px); } 30% { opacity: .9; } 45% { opacity: .2; } 100% { opacity: 1; transform: none; } }
+.clock { display: flex; align-items: baseline; gap: 10px; }
+.clock .seg { font-size: clamp(30px, 4.6cqw, 50px); }
+.clock .of { font-size: clamp(14px, 1.9cqw, 20px); opacity: .75; }
+.bar {
+  grid-column: 1 / -1; height: 10px; margin-top: 10px; --p: 0%;
+  background: linear-gradient(90deg, var(--orange) var(--p), var(--ghost) var(--p));
+  -webkit-mask: repeating-linear-gradient(90deg, #000 0 9px, transparent 9px 12px);
+  mask: repeating-linear-gradient(90deg, #000 0 9px, transparent 9px 12px);
+  filter: drop-shadow(0 0 4px #ff8a0080);
+}
+
+.scope { position: relative; margin-top: clamp(12px, 2cqw, 20px); border-top: var(--hairline); }
+#viz { display: block; width: 100%; height: clamp(190px, 33cqw, 360px); }
+.attract {
+  position: absolute; inset: 0; display: grid; place-items: center; background: none; border: 0; cursor: pointer; width: 100%;
+  font: 400 clamp(15px, 2.4cqw, 24px)/1 var(--display); letter-spacing: .16em; color: var(--paper); text-shadow: 0 0 14px #000, 0 0 30px #000;
+}
+.attract span { padding: 12px 18px; background: #0a0806d9; border: var(--hairline); animation: blink 1.7s steps(1) infinite; }
+@keyframes blink { 70% { opacity: 0; } }
+.attract[hidden] { display: none; }
+
+.vu { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 10px; align-items: center; border-top: var(--hairline); padding-top: 12px; }
+.vu .ch { font: 12px/1 var(--display); color: var(--orange); }
+#vu { display: block; width: 100%; height: 34px; grid-row: 1 / 3; grid-column: 2; }
+.vu .scale { grid-column: 2; display: flex; justify-content: space-between; font: 10px/1 var(--mono); color: var(--quiet); letter-spacing: .06em; }
+.vu .scale b { font-weight: 400; color: var(--pink); }
+
+/* a cue from the server (see "Cues" in the README) knocks the picture about for a moment */
+.glass.cue { animation: hijack 1.5s steps(2) 1; }
+@keyframes hijack {
+  0%, 100% { transform: none; filter: none; }
+  10% { transform: translate(-5px, 2px) skewX(3deg); filter: hue-rotate(-60deg) saturate(2.2); }
+  25% { transform: translate(6px, -1px); filter: invert(.9) hue-rotate(160deg); }
+  40% { transform: translate(-2px, 0) skewX(-2deg); filter: hue-rotate(90deg) contrast(1.6); }
+  60% { transform: translate(3px, 1px); filter: saturate(3) brightness(1.4); }
+  80% { transform: translate(-1px, -1px); filter: hue-rotate(-30deg); }
+}
+
+/* ---------- controls ---------- */
+.deck { display: flex; flex-wrap: wrap; align-items: center; gap: 16px clamp(16px, 3cqw, 34px); border-top: var(--hairline); border-bottom: var(--hairline); }
+.key {
+  display: inline-flex; align-items: center; gap: 10px; cursor: pointer; white-space: nowrap;
+  border: 1px solid #ff8a0066; background: linear-gradient(180deg, #262626, #161616); color: var(--quiet);
+  font: 11px/1 var(--mono); letter-spacing: .16em; text-transform: uppercase; padding: 11px 13px;
+  box-shadow: 0 3px 0 #000, inset 0 1px 0 #ffffff14; transition: transform .06s, box-shadow .06s, color .15s;
+}
+.key:hover { color: var(--paper); border-color: var(--orange); }
+.key:active { transform: translateY(2px); box-shadow: 0 1px 0 #000, inset 0 1px 0 #ffffff14; }
+.key .led { width: 7px; height: 7px; background: #ff8a0030; }
+.key[aria-pressed="true"] { color: var(--orange); border-color: var(--orange); }
+.key[aria-pressed="true"] .led { background: var(--orange); box-shadow: 0 0 8px var(--orange); }
+.key.play {
+  font: 400 16px/1 var(--display); letter-spacing: .12em; padding: 16px 24px 16px 20px; gap: 14px; min-width: 150px;
+  color: var(--ink-2); background: var(--orange); border-color: var(--orange);
+  box-shadow: 0 4px 0 #8a4a00, 0 0 26px #ff8a0055;
+}
+.key.play:hover { background: #ffa033; color: var(--ink-2); }
+.key.play:active { transform: translateY(3px); box-shadow: 0 1px 0 #8a4a00, 0 0 26px #ff8a0055; }
+.key.play .ico { width: 14px; height: 16px; background: currentColor; clip-path: polygon(0 0, 100% 50%, 0 100%); }
+.key.play.on { background: linear-gradient(180deg, #262626, #161616); color: var(--orange); box-shadow: 0 4px 0 #000, 0 0 26px #ff8a0033; }
+.key.play.on .ico { clip-path: none; height: 14px; }
+.state { display: grid; gap: 7px; min-width: 96px; }
+.state strong { font: 400 14px/1 var(--display); letter-spacing: .1em; color: var(--orange); }
+.state strong.idle { color: var(--quiet); }
+.vol { display: flex; align-items: center; gap: 12px; flex: 1 1 220px; min-width: 200px; }
+.volbar { position: relative; flex: 1; height: 22px; }
+.volbar .track {
+  position: absolute; inset: 0; --v: 80%;
+  background: linear-gradient(90deg, var(--orange) var(--v), var(--ghost) var(--v));
+  -webkit-mask: repeating-linear-gradient(90deg, #000 0 6px, transparent 6px 10px);
+  mask: repeating-linear-gradient(90deg, #000 0 6px, transparent 6px 10px);
+}
+.volbar input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.volbar:focus-within { outline: 2px solid var(--paper); outline-offset: 4px; }
+.vol output { font: 13px/1 var(--mono); color: var(--orange); width: 3ch; text-align: right; }
+.modes { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* ---------- lower panels ---------- */
+.panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr)); gap: clamp(14px, 2.6cqw, 28px); }
+.panel h2 { margin: 0 0 12px; display: flex; align-items: baseline; gap: 12px; font: 400 17px/1 var(--display); letter-spacing: .08em; color: var(--orange); text-transform: uppercase; }
+.panel h2 small { margin-left: auto; }
+.list { list-style: none; margin: 0; padding: 0; border-top: var(--hairline); }
+.list li { display: flex; align-items: baseline; gap: 14px; padding: 10px 0; border-bottom: 1px solid #ff8a0026; min-width: 0; }
+.list .n { font: 12px/1 var(--mono); color: var(--orange); flex: none; width: 3.2ch; }
+.list .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.list .a { font: 14px/1 var(--mono); color: var(--amber); flex: none; }
+.list li.first .t { color: var(--orange); }
+.list li.empty { opacity: .22; }
+.scores .t { font-family: var(--display); font-size: 14px; letter-spacing: .06em; text-transform: uppercase; }
+.scores li:nth-child(1) .t, .scores li:nth-child(1) .a { color: var(--pink); text-shadow: 0 0 10px #ff3d8b80; }
+.coin { display: inline-block; margin-top: 14px; font: 400 13px/1 var(--display); letter-spacing: .16em; color: var(--paper); text-decoration: none; animation: blink 1.7s steps(1) infinite; }
+.coin:hover { color: var(--orange); animation: none; }
+
+.feeds { display: grid; gap: 8px; border-top: var(--hairline); }
+.feed { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; min-width: 0; }
+.feed .lbl { width: 15ch; }
+.feed code { flex: 1 1 240px; min-width: 0; font: 12px/1.4 var(--mono); color: var(--peach); background: var(--glass); border: 1px solid #ff8a0026; padding: 7px 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.key.small { padding: 8px 10px; box-shadow: 0 2px 0 #000, inset 0 1px 0 #ffffff14; }
+[hidden] { display: none !important; }
+
+@media (max-width: 640px) {
+  .np { grid-template-columns: minmax(0, 1fr); }
+  .status { flex-wrap: wrap; }
+  .key.play { flex: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .attract span, .coin, .lamp.on i, .np.swap .title, .np.swap .artist, .glass.cue { animation: none; }
+}
+</style>
+</head>
+<body>
+<!--RADIO_CONFIG-->
+<main class="rack">
+  <header class="plate pad">
+    <div class="brand">
+      <h1 class="logo" id="logo">%STATION%</h1>
+      <span class="tag" id="tag"></span>
+    </div>
+    <div class="status">
+      <div class="lamp" id="onair"><i></i><span id="onairText">ON AIR</span></div>
+      <div class="readout"><span class="lbl">Station time</span><span class="seg" id="stationClock" role="img"></span></div>
+      <div class="readout"><span class="lbl">Listeners</span><span class="seg" id="listeners" role="img"></span></div>
+    </div>
+  </header>
+
+  <div class="pad">
+    <section class="glass pad" id="glass" aria-label="Now playing">
+      <div class="np" id="np">
+        <div class="np-top">
+          <span class="lbl">Now playing</span>
+          <span class="chip hot" id="kind"></span>
+          <span class="chip right" id="playlist"></span>
+        </div>
+        <div>
+          <h2 class="title" id="title">Tuning…</h2>
+          <p class="artist" id="artist"></p>
+        </div>
+        <div class="clock">
+          <span class="seg" id="elapsed" role="img"></span>
+          <span class="seg of" id="duration" role="img"></span>
+        </div>
+        <div class="bar" id="bar" role="progressbar" aria-label="Track position" aria-valuemin="0" aria-valuemax="100"></div>
+      </div>
+      <div class="scope">
+        <canvas id="viz" aria-hidden="true"></canvas>
+        <button class="attract" id="attract" type="button"><span>&#9654; PRESS PLAY TO TUNE IN</span></button>
+      </div>
+      <div class="vu" aria-hidden="true">
+        <span class="ch">L</span><canvas id="vu"></canvas>
+        <span class="ch">R</span>
+        <div class="scale"><span>-48</span><span>-36</span><span>-24</span><span>-12</span><b>0 dB</b></div>
+      </div>
+    </section>
+  </div>
+
+  <section class="deck pad" aria-label="Player controls">
+    <button class="key play" id="playBtn" type="button"><span class="ico"></span><span id="playText">PLAY</span></button>
+    <div class="state"><span class="lbl">Signal</span><strong id="state" class="idle">STANDBY</strong><span class="lbl" id="sync"></span></div>
+    <div class="vol">
+      <span class="lbl">Volume</span>
+      <span class="volbar"><span class="track" id="volTrack"></span><input id="vol" type="range" min="0" max="100" value="80" aria-label="Volume"></span>
+      <output id="volNum" for="vol">80</output>
+    </div>
+    <div class="modes" id="modes" role="group" aria-label="Visualizer">
+      <button class="key" type="button" data-mode="spectrum"><span class="led"></span>Spectrum</button>
+      <button class="key" type="button" data-mode="mirror"><span class="led"></span>Mirror</button>
+      <button class="key" type="button" data-mode="scope"><span class="led"></span>Scope</button>
+      <button class="key" type="button" data-mode="sunset"><span class="led"></span>Sunset</button>
+    </div>
+  </section>
+
+  <div class="panels pad">
+    <section class="panel">
+      <h2>Up next</h2>
+      <ol class="list" id="queue"></ol>
+    </section>
+    <section class="panel" id="scoresPanel" hidden>
+      <h2>Top supporters <small class="lbl">Ko-fi</small></h2>
+      <ol class="list scores" id="scores"></ol>
+      <a class="coin" id="coin" target="_blank" rel="noopener" hidden>INSERT COIN &#9654;</a>
+    </section>
+  </div>
+
+  <footer class="feeds pad">
+    <div class="feed" id="hlsFeed" hidden><span class="lbl">VRChat / HLS</span><code id="hlsUrl"></code><button class="key small" type="button" data-copy="hlsUrl">Copy</button></div>
+    <div class="feed"><span class="lbl">MP3 stream</span><code id="mp3Url"></code><button class="key small" type="button" data-copy="mp3Url">Copy</button></div>
+  </footer>
+</main>
+
+<audio id="player" preload="none"></audio>
+<script>
+'use strict';
+const R = window.RADIO || {};
+const $ = id => document.getElementById(id);
+const store = { get(k, d) { try { return localStorage.getItem(k) ?? d; } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
+
+// ---------------------------------------------------------------------------
+// Seven segment readouts
+// ---------------------------------------------------------------------------
+const SEGMENTS = { 0: 'abcdef', 1: 'bc', 2: 'abdeg', 3: 'abcdg', 4: 'bcfg', 5: 'acdfg', 6: 'acdefg', 7: 'abc', 8: 'abcdefg', 9: 'abcdfg', '-': 'g', ' ': '' };
+const hbar = y => `2.6,${y} 3.6,${y - 1} 8.4,${y - 1} 9.4,${y} 8.4,${y + 1} 3.6,${y + 1}`;
+const vbar = (x, a, b) => `${x},${a} ${x + 1},${a + 1} ${x + 1},${b - 1} ${x},${b} ${x - 1},${b - 1} ${x - 1},${a + 1}`;
+const SHAPES = { a: hbar(1.5), g: hbar(10), d: hbar(18.5), f: vbar(2, 2, 9.5), b: vbar(10, 2, 9.5), e: vbar(2, 10.5, 18), c: vbar(10, 10.5, 18) };
+function seg(el, text) {
+  if (el.dataset.v === text) return;
+  el.dataset.v = text;
+  el.setAttribute('aria-label', text.trim());
+  el.innerHTML = [...text].map(ch => ch === ':'
+    ? '<svg class="colon" viewBox="0 0 4 20"><circle class="s1" cx="2" cy="6" r="1.2"/><circle class="s1" cx="2" cy="14" r="1.2"/></svg>'
+    : '<svg viewBox="0 0 12 20">' + Object.keys(SHAPES).map(k => `<polygon class="${(SEGMENTS[ch] || '').includes(k) ? 's1' : 's0'}" points="${SHAPES[k]}"/>`).join('') + '</svg>').join('');
+}
+const fmt = s => { s = Math.max(0, Math.floor(s)); return String(Math.floor(s / 60)).padStart(2, ' ') + ':' + String(s % 60).padStart(2, '0'); };
+
+// ---------------------------------------------------------------------------
+// Static bits
+// ---------------------------------------------------------------------------
+(function () {
+  const words = (R.name || document.title).split(' ');
+  const logo = $('logo');
+  logo.textContent = '';
+  const first = document.createElement('b');
+  first.textContent = words.shift();
+  logo.append(first, words.length ? ' ' + words.join(' ') : '');
+  $('tag').textContent = R.description || '';
+  $('mp3Url').textContent = R.mp3Url || '';
+  if (R.hlsUrl) { $('hlsUrl').textContent = R.hlsUrl; $('hlsFeed').hidden = false; }
+  if (R.kofiUrl) { $('coin').href = R.kofiUrl; $('coin').hidden = false; }
+  for (const b of document.querySelectorAll('[data-copy]')) {
+    b.onclick = async () => {
+      const text = $(b.dataset.copy).textContent;
+      try { await navigator.clipboard.writeText(text); } catch (e) {
+        const r = document.createRange(); r.selectNodeContents($(b.dataset.copy));
+        const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+        try { document.execCommand('copy'); } catch (e2) { return; }
+      }
+      b.textContent = 'Copied'; setTimeout(() => { b.textContent = 'Copy'; }, 1400);
+    };
+  }
+  seg($('elapsed'), ' -:--'); seg($('duration'), ' -:--'); seg($('listeners'), '---'); seg($('stationClock'), '--:--');
+})();
+
+// ---------------------------------------------------------------------------
+// Player
+// ---------------------------------------------------------------------------
+// This page sits much closer to the live edge than AVPro does, so it measures its own lag
+// from the stream's PROGRAM-DATE-TIME rather than assuming the AVPro figure.
+const player = $('player');
+let hls = null, lag = R.hls ? R.segmentSeconds * 3 : 0;
+function attachStream() {
+  if (R.hls && window.Hls && Hls.isSupported()) {
+    hls = new Hls({ liveSyncDurationCount: 3, backBufferLength: 30 });
+    hls.loadSource('/hls/live.m3u8'); hls.attachMedia(player);
+    // A fatal error would otherwise leave the page deaf until a reload: the playlist is
+    // missing for the first seconds after the server starts, and networks drop.
+    hls.on(Hls.Events.ERROR, (ev, data) => {
+      if (!data.fatal) return;
+      if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+      else setTimeout(() => { hls.loadSource('/hls/live.m3u8'); }, 3000);
+    });
+  }
+  else if (R.hls && player.canPlayType('application/vnd.apple.mpegurl')) { player.src = '/hls/live.m3u8'; }
+  else { player.src = R.mount; lag = 0; }
+}
+// ?trim=N adds N seconds to the measured lag (the playlist's PROGRAM-DATE-TIME is anchored
+// about one segment late, and players differ), so the display can be dialled in live.
+const trim = Number(new URLSearchParams(location.search).get('trim') || 0) || 0;
+// ffmpeg anchors the first PROGRAM-DATE-TIME about one segment after that audio actually
+// entered the encoder, so playingDate reads late and the measured lag comes out low by
+// roughly one segment. Without this the title changes before you hear the song.
+const pdtCorrection = R.hls ? R.segmentSeconds : 0;
+let measured = null;
+function measure(serverTime) {
+  try {
+    if (!hls || !hls.playingDate) return;
+    const d = (Date.parse(serverTime) - hls.playingDate.getTime()) / 1000;
+    if (isFinite(d) && d >= 0 && d < 300) { measured = d; lag = d + pdtCorrection + trim; }
+  } catch (e) {}
+}
+
+// The analysers tap the signal before the volume control, so the meters show the
+// programme rather than how loud this listener has it.
+let actx = null, anMix = null, anL = null, anR = null, gain = null;
+function initAudio() {
+  if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+  try {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = actx.createMediaElementSource(player);
+    const analyser = (size, smooth) => { const a = actx.createAnalyser(); a.fftSize = size; a.smoothingTimeConstant = smooth; a.minDecibels = -86; a.maxDecibels = -24; return a; };
+    anMix = analyser(4096, 0.72); anL = analyser(2048, 0.72); anR = analyser(2048, 0.72);
+    const split = actx.createChannelSplitter(2);
+    gain = actx.createGain();
+    src.connect(anMix); src.connect(split); split.connect(anL, 0); split.connect(anR, 1);
+    src.connect(gain); gain.connect(actx.destination);
+    player.volume = 1;
+    setVolume();
+  } catch (e) { actx = null; }
+}
+
+const playBtn = $('playBtn'), stateEl = $('state'), vol = $('vol');
+function setState(text, idle) { stateEl.textContent = text; stateEl.classList.toggle('idle', !!idle); }
+function toggle() {
+  if (player.paused) { initAudio(); setState('TUNING'); player.play().catch(() => setState('STANDBY', true)); }
+  else player.pause();
+}
+playBtn.onclick = toggle;
+$('attract').onclick = toggle;
+player.onplaying = () => { playBtn.classList.add('on'); $('playText').textContent = 'STOP'; setState('LIVE'); $('attract').hidden = true; };
+player.onwaiting = () => { if (!player.paused) setState('BUFFERING'); };
+player.onpause = () => { playBtn.classList.remove('on'); $('playText').textContent = 'PLAY'; setState('STANDBY', true); $('attract').hidden = false; };
+function setVolume() {
+  const v = vol.value / 100;
+  if (gain) gain.gain.value = v * v; else player.volume = v;
+  $('volTrack').style.setProperty('--v', vol.value + '%');
+  $('volNum').textContent = vol.value;
+  store.set('radio.volume', vol.value);
+}
+vol.value = store.get('radio.volume', 80);
+vol.oninput = setVolume;
+setVolume();
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' && !/^(BUTTON|INPUT|A)$/.test(document.activeElement.tagName)) { e.preventDefault(); toggle(); }
+});
+
+// ---------------------------------------------------------------------------
+// Now playing
+// ---------------------------------------------------------------------------
+const KIND_LABELS = { bumper: 'Station ID', intro: 'Intro', hourly: 'Time check', cue: 'Transmission' };
+let now = null, nowAt = 0, skew = 0, fails = 0, lastFile = null, lastCue = null;
+
+function row(cls, n, t, a) {
+  const li = document.createElement('li');
+  if (cls) li.className = cls;
+  for (const [c, text] of [['n', n], ['t', t], ['a', a]]) {
+    if (text == null) continue;
+    const s = document.createElement('span'); s.className = c; s.textContent = text; li.append(s);
+  }
+  return li;
+}
+const ORDINALS = ['1ST', '2ND', '3RD'];
+function renderLists(j) {
+  const up = (j.upcoming && j.upcoming.length ? j.upcoming : j.next ? [j.next.display] : []).slice(0, 5);
+  const key = JSON.stringify([up, j.donors]);
+  if (renderLists.key === key) return;
+  renderLists.key = key;
+  const q = up.map((t, i) => row(i ? '' : 'first', String(i + 1).padStart(2, '0'), t));
+  $('queue').replaceChildren(...(q.length ? q : [row('empty', '--', 'Nothing queued')]));
+  $('scoresPanel').hidden = !j.donors;
+  if (j.donors) {
+    const sign = R.currency === 'USD' ? '$' : '';
+    const rows = j.donors.map((d, i) => row('', ORDINALS[i] || (i + 1) + 'TH', d.name, sign + d.amount + (sign ? '' : ' ' + R.currency)));
+    for (let i = rows.length; i < 5; i++) rows.push(row('empty', ORDINALS[i] || (i + 1) + 'TH', '---', ''));
+    $('scores').replaceChildren(...rows);
+  }
+}
+
+function scheduleCue(c) {
+  if (!c || c.id === lastCue || c.in < -2) return;
+  lastCue = c.id;
+  setTimeout(() => {
+    const g = $('glass');
+    g.classList.remove('cue'); void g.offsetWidth; g.classList.add('cue');
+  }, Math.max(0, c.in * 1000));
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/now.json?delay=' + Math.max(0, Math.round(lag)), { cache: 'no-store' });
+    const j = await r.json();
+    fails = 0;
+    measure(j.serverTime);
+    skew = Date.parse(j.serverTime) - Date.now();
+    now = j.now; nowAt = performance.now();
+    const n = j.now;
+    const file = n ? n.file : null;
+    if (file !== lastFile) {
+      lastFile = file;
+      const split = n && n.kind === 'song' && n.artist && n.title;
+      $('title').textContent = n ? (split ? n.title : n.display) : 'Silence';
+      $('artist').textContent = split ? n.artist : '';
+      $('kind').textContent = n && n.kind !== 'song' ? (KIND_LABELS[n.kind] || n.kind) : '';
+      $('np').classList.remove('swap'); void $('np').offsetWidth; $('np').classList.add('swap');
+      if (n && 'mediaSession' in navigator && window.MediaMetadata) {
+        navigator.mediaSession.metadata = new MediaMetadata({ title: split ? n.title : n.display, artist: split ? n.artist : R.name, album: R.name });
+      }
+    }
+    seg($('duration'), n && n.duration ? fmt(n.duration) : ' -:--');
+    seg($('listeners'), String(Math.min(999, j.listeners || 0)).padStart(3, ' '));
+    $('playlist').textContent = j.playlist && j.playlist.display ? j.playlist.display : '';
+    $('sync').textContent = measured === null ? '' : lag.toFixed(1) + 's behind' + (trim ? ' (trim ' + (trim > 0 ? '+' : '') + trim + ')' : '');
+    renderLists(j);
+    scheduleCue(j.cue);
+    $('onair').classList.add('on'); $('onairText').textContent = 'ON AIR';
+  } catch (e) {
+    if (++fails >= 3) { $('onair').classList.remove('on'); $('onairText').textContent = 'NO SIGNAL'; }
+  }
+}
+
+// Position runs on between polls so the readout counts smoothly.
+const clockFmt = (() => { try { return new Intl.DateTimeFormat('en-GB', { timeZone: R.timezone, hour: '2-digit', minute: '2-digit', hour12: false }); } catch (e) { return new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false }); } })();
+function tick() {
+  const t = new Date(Date.now() + skew);
+  seg($('stationClock'), clockFmt.format(t));
+  $('stationClock').classList.toggle('tick', t.getSeconds() % 2 === 1);
+  if (!now) { seg($('elapsed'), ' -:--'); $('bar').style.setProperty('--p', '0%'); return; }
+  let pos = now.position + (performance.now() - nowAt) / 1000;
+  if (now.duration) pos = Math.min(pos, now.duration);
+  seg($('elapsed'), fmt(pos));
+  const pct = now.duration ? Math.min(100, 100 * pos / now.duration) : 0;
+  $('bar').style.setProperty('--p', pct.toFixed(2) + '%');
+  $('bar').setAttribute('aria-valuenow', Math.round(pct));
+}
+
+// ---------------------------------------------------------------------------
+// Visualizers
+// ---------------------------------------------------------------------------
+// Every mode draws its lit parts into `lit`; the frame then lays that over the `ghost`
+// layer (the unlit segments or graticule, drawn once per resize) with a blurred copy for
+// the tube glow. With no audio to read (paused, or no Web Audio) the modes idle on a slow
+// wave at half brightness.
+const C = { orange: '#ff8a00', amber: '#ffc233', pink: '#ff3d8b', cyan: '#5ef1ff', ghost: 'rgba(255,138,0,0.085)' };
+const cv = $('viz'), cx = cv.getContext('2d');
+const lit = document.createElement('canvas'), lg = lit.getContext('2d');
+const ghost = document.createElement('canvas'), gg = ghost.getContext('2d');
+const canBlur = typeof cx.filter === 'string';
+let W = 0, H = 0, DPR = 1, mode = 'spectrum';
+
+const FMIN = 45, FMAX = 16000, MAXBARS = 96;
+const bank = () => ({ v: new Float32Array(MAXBARS), p: new Float32Array(MAXBARS), hold: new Float32Array(MAXBARS) });
+const bMix = bank(), bL = bank(), bR = bank();
+let fMix = null, fL = null, fR = null, tMix = null, tL = null, tR = null;
+const isLive = () => !!(actx && anMix && !player.paused);
+
+// Log-spaced bars with meter ballistics: quick up, steady fall, and a peak cap that hangs.
+function fillBank(b, an, buf, n, dt, t, phase) {
+  const live = isLive();
+  let binHz = 0;
+  if (live) { an.getByteFrequencyData(buf); binHz = actx.sampleRate / an.fftSize; }
+  for (let i = 0; i < n; i++) {
+    let x;
+    if (live) {
+      const a = FMIN * Math.pow(FMAX / FMIN, i / n) / binHz, z = FMIN * Math.pow(FMAX / FMIN, (i + 1) / n) / binHz;
+      if (z - a < 1) { const m = (a + z) / 2, k = Math.floor(m); x = buf[k] * (1 - (m - k)) + buf[k + 1] * (m - k); }
+      else { x = 0; for (let k = Math.ceil(a); k <= Math.floor(z); k++) if (buf[k] > x) x = buf[k]; }
+      x = Math.min(1, (x / 255) * (0.88 + 0.5 * i / n));   // lift the top end, which carries less energy
+    } else {
+      const u = i / n;
+      x = Math.max(0, 0.3 + 0.2 * Math.sin(t * 1.1 + u * 7 + phase) + 0.14 * Math.sin(t * 0.63 - u * 13 + phase * 2)) * (1 - 0.35 * u);
+    }
+    b.v[i] = x > b.v[i] ? b.v[i] + (x - b.v[i]) * Math.min(1, dt * 30) : Math.max(x, b.v[i] - dt * 1.5);
+    if (b.v[i] >= b.p[i]) { b.p[i] = b.v[i]; b.hold[i] = 0.45; }
+    else if ((b.hold[i] -= dt) < 0) b.p[i] = Math.max(b.v[i], b.p[i] - dt * 0.55);
+  }
+}
+
+const zone = f => (f > 0.86 ? C.pink : f > 0.66 ? C.amber : C.orange);
+// One block of segmented bars. o: { x, w, cols, rows, base, dir (-1 grows up, 1 grows down),
+// seg, gap, pick(col) -> bar index, bank (omit to draw every segment, for the ghost layer) }
+function drawBars(g, o) {
+  const pitch = o.w / o.cols, bw = Math.max(2, pitch - Math.max(2, pitch * 0.2)), step = o.seg + o.gap;
+  for (let r = 0; r < o.rows; r++) {
+    const y = o.dir < 0 ? o.base - (r + 1) * step + o.gap : o.base + r * step;
+    g.fillStyle = o.bank ? zone(r / (o.rows - 1)) : C.ghost;
+    g.beginPath();
+    for (let c = 0; c < o.cols; c++) {
+      if (!o.bank || Math.round(o.bank.v[o.pick(c)] * o.rows) > r) g.rect(o.x + c * pitch, y, bw, o.seg);
+    }
+    g.fill();
+  }
+  if (!o.bank) return;
+  g.fillStyle = C.cyan;
+  g.beginPath();
+  for (let c = 0; c < o.cols; c++) {
+    const r = Math.min(o.rows - 1, Math.round(o.bank.p[o.pick(c)] * o.rows));
+    if (r < 1) continue;
+    g.rect(o.x + c * pitch, o.dir < 0 ? o.base - (r + 1) * step + o.gap : o.base + r * step, bw, o.seg);
+  }
+  g.fill();
+}
+
+const L = {};   // layout for the current mode, rebuilt on resize
+const MODES = {
+  // Classic rack analyser: one row of segmented bars, low to high.
+  spectrum: {
+    layout() {
+      L.cols = Math.max(20, Math.min(72, Math.floor(W / 17)));
+      L.seg = H > 260 ? 7 : 5; L.gap = 3;
+      L.rows = Math.floor((H - 16) / (L.seg + L.gap));
+      L.o = bankOrNot => ({ x: 0, w: W, cols: L.cols, rows: L.rows, base: H - 4, dir: -1, seg: L.seg, gap: L.gap, pick: c => c, bank: bankOrNot });
+    },
+    ghost(g) { drawBars(g, L.o(null)); },
+    draw(g, dt, t) { fillBank(bMix, anMix, fMix, L.cols, dt, t, 0); drawBars(g, L.o(bMix)); },
+  },
+  // True stereo: left channel on the left, right on the right, bass meeting in the middle,
+  // and the whole thing reflected below the centre line.
+  mirror: {
+    layout() {
+      L.half = Math.max(12, Math.min(40, Math.floor(W / 30)));
+      L.seg = 5; L.gap = 3;
+      L.rows = Math.floor((H / 2 - 8) / (L.seg + L.gap));
+      const side = (x, pick) => (b, dir) => ({ x, w: W / 2 - 3, cols: L.half, rows: L.rows, base: H / 2 + dir * 2, dir, seg: L.seg, gap: L.gap, pick, bank: b });
+      L.left = side(0, c => L.half - 1 - c); L.right = side(W / 2 + 3, c => c);
+    },
+    ghost(g) { for (const s of [L.left, L.right]) { drawBars(g, s(null, -1)); drawBars(g, s(null, 1)); } },
+    draw(g, dt, t) {
+      fillBank(bL, anL, fL, L.half, dt, t, 0); fillBank(bR, anR, fR, L.half, dt, t, 1.3);
+      drawBars(g, L.left(bL, -1)); drawBars(g, L.right(bR, -1));
+      g.globalAlpha = 0.5; drawBars(g, L.left(bL, 1)); drawBars(g, L.right(bR, 1)); g.globalAlpha = 1;
+    },
+  },
+  // Amber phosphor oscilloscope. The frame loop fades this one instead of clearing it.
+  scope: {
+    persist: true,
+    layout() {},
+    ghost(g) {
+      g.strokeStyle = 'rgba(255,138,0,0.13)'; g.lineWidth = 1; g.beginPath();
+      for (let i = 1; i < 10; i++) { const x = Math.round(W * i / 10) + 0.5; g.moveTo(x, 0); g.lineTo(x, H); }
+      for (let i = 1; i < 6; i++) { const y = Math.round(H * i / 6) + 0.5; g.moveTo(0, y); g.lineTo(W, y); }
+      g.stroke();
+      g.strokeStyle = 'rgba(255,138,0,0.3)'; g.beginPath();
+      for (let i = 0; i <= 50; i++) { const x = W * i / 50; g.moveTo(x, H / 2 - 3); g.lineTo(x, H / 2 + 3); }
+      g.stroke();
+    },
+    draw(g, dt, t) {
+      const n = 1024, mid = H / 2, amp = H * 0.42;
+      let start = 0;
+      const live = isLive();
+      if (live) {
+        anMix.getFloatTimeDomainData(tMix);
+        for (let i = 1; i < tMix.length - n; i++) if (tMix[i - 1] < 0 && tMix[i] >= 0) { start = i; break; }   // hold the trace still
+      }
+      g.strokeStyle = C.orange; g.lineWidth = 2; g.lineJoin = 'round'; g.beginPath();
+      for (let i = 0; i < n; i++) {
+        const u = i / (n - 1);
+        const s = live ? Math.max(-1, Math.min(1, tMix[start + i] * 1.6)) : 0.28 * Math.sin(u * 14 + t * 2.2) * Math.sin(u * 3.1 - t * 0.7);
+        if (i) g.lineTo(u * W, mid - s * amp); else g.moveTo(0, mid - s * amp);
+      }
+      g.stroke();
+    },
+  },
+  // Outrun: a striped sun that swells on the bass, a grid floor that runs faster the louder
+  // it gets, and the spectrum as a skyline along the horizon.
+  sunset: {
+    layout() {
+      L.hz = Math.round(H * 0.6); L.half = Math.max(10, Math.min(30, Math.floor(W / 40)));
+      L.scroll = L.scroll || 0;
+      const side = (x, pick) => b => ({ x, w: W / 2, cols: L.half, rows: Math.floor(L.hz * 0.7 / 7), base: L.hz, dir: -1, seg: 4, gap: 3, pick, bank: b });
+      L.left = side(0, c => c); L.right = side(W / 2, c => L.half - 1 - c);
+    },
+    ghost(g) {
+      g.fillStyle = 'rgba(242,239,233,0.35)';
+      for (let i = 0; i < 70; i++) { const s = Math.sin(i * 127.1) * 43758.5453, r = Math.sin(i * 311.7) * 24634.6345; g.fillRect((s - Math.floor(s)) * W, (r - Math.floor(r)) * L.hz * 0.9, 1.5, 1.5); }
+    },
+    draw(g, dt, t) {
+      fillBank(bL, anL, fL, L.half, dt, t, 0); fillBank(bR, anR, fR, L.half, dt, t, 1.3);
+      let bass = 0, all = 0;
+      for (let i = 0; i < L.half; i++) { const v = (bL.v[i] + bR.v[i]) / 2; all += v; if (i < 4) bass += v; }
+      bass /= 4; all /= L.half;
+      const hz = L.hz, cxm = W / 2, rad = Math.min(W * 0.2, hz * 0.56) * (0.9 + 0.2 * bass);
+
+      // sun
+      g.save();
+      g.beginPath(); g.rect(0, 0, W, hz); g.clip();
+      const sun = g.createLinearGradient(0, hz - rad * 1.6, 0, hz);
+      sun.addColorStop(0, C.amber); sun.addColorStop(0.5, C.orange); sun.addColorStop(1, C.pink);
+      g.fillStyle = sun; g.beginPath(); g.arc(cxm, hz - rad * 0.55, rad, 0, Math.PI * 2); g.fill();
+      g.globalCompositeOperation = 'destination-out';
+      for (let i = 0; i < 7; i++) {   // the slits, widening toward the horizon and drifting down
+        const k = (i + (t * 0.25) % 1) / 7, y = hz - rad * 1.1 * (1 - k * k);
+        g.fillRect(cxm - rad, y, rad * 2, 1 + k * 7);
+      }
+      g.restore();
+
+      // skyline
+      drawBars(g, L.left(bL)); drawBars(g, L.right(bR));
+
+      // floor
+      L.scroll = (L.scroll + dt * (0.18 + all * 1.1)) % 1;
+      g.strokeStyle = C.pink; g.lineWidth = 1.5; g.beginPath();
+      g.moveTo(0, hz + 0.5); g.lineTo(W, hz + 0.5);
+      for (let i = -14; i <= 14; i++) { g.moveTo(cxm + i * W * 0.028, hz); g.lineTo(cxm + i * W * 0.2, H); }
+      for (let i = 0; i < 9; i++) { const k = (i + L.scroll) / 9, y = hz + (H - hz) * k * k; g.moveTo(0, y); g.lineTo(W, y); }
+      g.stroke();
+    },
+  },
+};
+
+// Level meters: RMS per channel on a dB scale, with a peak segment that hangs.
+const vuCv = $('vu'), vx = vuCv.getContext('2d');
+const vu = { v: [0, 0], p: [0, 0], hold: [0, 0] };
+function drawVu(dt, t) {
+  const w = vuCv.width, h = vuCv.height, n = Math.max(24, Math.min(64, Math.floor(w / DPR / 12))), pitch = w / n, bw = pitch - 3 * DPR, rowH = Math.floor(h * 0.38);
+  vx.clearRect(0, 0, w, h);
+  const live = isLive();
+  [[anL, tL], [anR, tR]].forEach(([an, buf], ch) => {
+    let x;
+    if (live) {
+      an.getFloatTimeDomainData(buf);
+      let sum = 0; for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+      x = Math.max(0, Math.min(1, (20 * Math.log10(Math.sqrt(sum / buf.length) + 1e-9) + 48) / 48));
+    } else x = 0.3 + 0.12 * Math.sin(t * 1.4 + ch * 0.9);
+    vu.v[ch] = x > vu.v[ch] ? x : Math.max(x, vu.v[ch] - dt * 0.9);
+    if (vu.v[ch] >= vu.p[ch]) { vu.p[ch] = vu.v[ch]; vu.hold[ch] = 0.8; } else if ((vu.hold[ch] -= dt) < 0) vu.p[ch] = Math.max(vu.v[ch], vu.p[ch] - dt * 0.4);
+    const y = ch ? h - rowH : 0, on = Math.round(vu.v[ch] * n), peak = Math.round(vu.p[ch] * n) - 1;
+    vx.globalAlpha = live ? 1 : 0.5;
+    for (let i = 0; i < n; i++) {
+      vx.fillStyle = i < on || i === peak ? zone(i / (n - 1) * 0.99 + (i >= n - 3 ? 0.2 : 0)) : C.ghost;
+      vx.fillRect(i * pitch, y, bw, rowH);
+    }
+    vx.globalAlpha = 1;
+  });
+}
+
+function buildGhost() {
+  gg.clearRect(0, 0, W, H);
+  lg.clearRect(0, 0, W, H);
+  MODES[mode].layout();
+  MODES[mode].ghost(gg);
+}
+function resize() {
+  const r = cv.getBoundingClientRect();
+  if (!r.width) return;
+  DPR = Math.min(2, window.devicePixelRatio || 1); W = Math.round(r.width); H = Math.round(r.height);
+  for (const c of [cv, lit, ghost]) { c.width = W * DPR; c.height = H * DPR; }
+  lg.setTransform(DPR, 0, 0, DPR, 0, 0); gg.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const v = vuCv.getBoundingClientRect(); vuCv.width = Math.round(v.width * DPR); vuCv.height = Math.round(v.height * DPR);
+  buildGhost();
+}
+function setMode(m) {
+  mode = MODES[m] ? m : 'spectrum';
+  store.set('radio.viz', mode);
+  for (const b of $('modes').children) b.setAttribute('aria-pressed', String(b.dataset.mode === mode));
+  for (const b of [bMix, bL, bR]) { b.v.fill(0); b.p.fill(0); }   // no stale peaks from the last mode
+  if (W) buildGhost();
+}
+for (const b of $('modes').children) b.onclick = () => setMode(b.dataset.mode);
+
+let lastTs = 0;
+function frame(ts) {
+  requestAnimationFrame(frame);
+  if (!W) return;
+  const dt = Math.min(0.1, (ts - lastTs) / 1000 || 0.016); lastTs = ts;
+  const t = ts / 1000, live = isLive();
+  if (live && !fMix) {
+    fMix = new Uint8Array(anMix.frequencyBinCount); fL = new Uint8Array(anL.frequencyBinCount); fR = new Uint8Array(anR.frequencyBinCount);
+    tMix = new Float32Array(anMix.fftSize); tL = new Float32Array(anL.fftSize); tR = new Float32Array(anR.fftSize);
+  }
+  if (MODES[mode].persist) {
+    lg.globalCompositeOperation = 'destination-out'; lg.fillStyle = 'rgba(0,0,0,0.3)'; lg.fillRect(0, 0, W, H); lg.globalCompositeOperation = 'source-over';
+  } else lg.clearRect(0, 0, W, H);
+  MODES[mode].draw(lg, dt, t);
+
+  cx.clearRect(0, 0, cv.width, cv.height);
+  cx.drawImage(ghost, 0, 0);
+  const a = live ? 1 : 0.5;
+  if (canBlur) {
+    cx.save(); cx.filter = `blur(${7 * DPR}px)`; cx.globalCompositeOperation = 'lighter'; cx.globalAlpha = a * 0.75; cx.drawImage(lit, 0, 0); cx.restore();
+  }
+  cx.globalAlpha = a; cx.drawImage(lit, 0, 0); cx.globalAlpha = 1;
+  drawVu(dt, t);
+}
+
+// ---------------------------------------------------------------------------
+// Go
+// ---------------------------------------------------------------------------
+function start() {
+  attachStream();
+  setMode(store.get('radio.viz', 'spectrum'));
+  new ResizeObserver(resize).observe(cv);
+  resize();
+  requestAnimationFrame(frame);
+  poll(); setInterval(poll, 2000);
+  tick(); setInterval(tick, 250);
+}
+if (R.hls) {
+  // hls.js is only needed where the browser cannot play HLS itself; if the CDN is out of
+  // reach the page still works on the MP3 mount.
+  const s = document.createElement('script');
+  s.src = 'https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.15/hls.min.js';
+  s.onload = s.onerror = start;
+  document.head.append(s);
+} else start();
+</script>
+</body>
+</html>

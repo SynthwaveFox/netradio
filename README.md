@@ -425,7 +425,7 @@ treat it as a proper Icecast mount.
 | `HOURLY_GRACE_MINUTES` | `20` | skip the time check if the break comes later than this past the hour |
 | `VOLUME` | `1` | extra linear gain |
 | `BURST_SECONDS` | `8` | audio sent instantly to a new listener. This is the player's cushion against jitter; every listener starts from the beginning of it, so it delays everyone equally and does not loosen sync. Too small (< 5) makes AVPro stutter and re-sync a few seconds in |
-| `STATION_NAME`, `STATION_DESCRIPTION`, `STATION_GENRE` | Gizmo Radio… | icy headers |
+| `STATION_NAME`, `STATION_DESCRIPTION`, `STATION_GENRE` | Starlight Radio… | icy headers |
 | `ADMIN_TOKEN` | | enables `/skip` and `/reload` |
 | `HLS` | `1` | also encodes an AAC HLS stream into `hls/` and serves `/hls/live.m3u8`. `0` disables |
 | `HLS_BITRATE`, `HLS_SEGMENT_SECONDS` | `128`, `4` | |
@@ -474,6 +474,21 @@ $env:STATION_NAME="Fennia FM"; $env:ADMIN_TOKEN="changeme"; $env:HLS="1"; node n
    song. Compare against `/now.json` if in doubt.
 4. Once it works, put it behind the same domain/TLS as the CDN so Quest users (https only)
    can tune in, then set `PUBLIC_URL` accordingly.
+
+## Web player (`web/`)
+
+`GET /` serves `web/index.html`: now playing, a segmented spectrum analyser with three other
+visualizer modes (stereo mirror, oscilloscope, outrun sunset), level meters, the queue and the
+supporter board. Upload the `web/` folder next to `netradio.js`. It is optional: without it the
+server falls back to a plain built-in page. The file is re-read when it changes, so edits need
+no restart, and anything else in `web/` (the fonts) is served under `/web/`.
+
+- The meters read the audio in the browser (Web Audio), ahead of the volume control, so they
+  show the programme and not how loud the listener has it. Until play is pressed, and in
+  browsers that cannot analyse the stream, they idle on a slow wave at half brightness.
+- A cue (see "Cues" above) glitches the display at the moment listeners hear it.
+- `/now.json` carries the supporter board as `donors: [{ name, amount }]` (`null` without
+  `donors.mjs`). `KOFI_URL` in `.env` adds an "insert coin" link under the board.
 
 ## Supporter board (Ko-fi)
 

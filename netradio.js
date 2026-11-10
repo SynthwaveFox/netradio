@@ -15,6 +15,7 @@
 //   GET  /health      "ok"
 //   GET  /hls/live.m3u8  HLS mirror of the same stream — use this URL in VRChat (HLS=0 disables)
 //   POST /kofi/webhook Ko-fi payments, for the supporter board in /now.txt (see donors.mjs)
+//   GET  /web/...      Fonts and other files for the web player (web/index.html)
 //   POST /skip?token=  skip current track (ADMIN_TOKEN must be set)
 //   POST /seek?token=&by=30 | &to=90   seek within the current track
 //   POST /reload?token= rescan the library
@@ -104,7 +105,7 @@ const CONFIG = {
   maxClientBacklog: Number(process.env.MAX_CLIENT_BACKLOG || 1024 * 1024), // drop slow clients
   icyMetaInt: 16000,
 
-  name: process.env.STATION_NAME || 'Gizmo Radio',
+  name: process.env.STATION_NAME || 'Starlight Radio',
   description: process.env.STATION_DESCRIPTION || 'Continuous shuffled songs with bumpers',
   genre: process.env.STATION_GENRE || 'Mixed',
 
@@ -117,6 +118,9 @@ const CONFIG = {
   hlsKeepSegments: Number(process.env.HLS_KEEP_SEGMENTS || 15),     // extra expired segments kept on disk for players that fell behind
 
   adminToken: process.env.ADMIN_TOKEN || '',
+
+  webDir: process.env.WEB_DIR || path.join(__dirname, 'web'),      // the web player (index.html + fonts); optional
+  kofiUrl: process.env.KOFI_URL || '',                             // "insert coin" link under the page's supporter board
 
   donors: {
     verificationToken: process.env.KOFI_VERIFICATION_TOKEN || '',
@@ -2410,6 +2414,51 @@ function serveHls(req, res, urlPath, hlsAudience) {
   });
 }
 
+// The web player lives in web/index.html, next to this file. It is optional, like
+// importer.mjs: without it the plain built-in page below is served. Re-read when it changes.
+const WEB_TYPES = { '.woff2': 'font/woff2', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon' };
+let webPageCache = { mtimeMs: 0, html: '' };
+
+function webPageHtml(req, donors) {
+  const file = path.join(CONFIG.webDir, 'index.html');
+  try {
+    const { mtimeMs } = fs.statSync(file);
+    if (mtimeMs !== webPageCache.mtimeMs) webPageCache = { mtimeMs, html: fs.readFileSync(file, 'utf8') };
+  } catch {
+    return null;
+  }
+  const url = streamUrl(req);
+  const config = {
+    name: CONFIG.name,
+    description: CONFIG.description,
+    mount: CONFIG.mount,
+    mp3Url: url,
+    hls: CONFIG.hls,
+    hlsUrl: CONFIG.hls ? url.replace(CONFIG.mount, '') + '/hls/live.m3u8' : '',
+    segmentSeconds: CONFIG.hlsSegmentSeconds,
+    timezone: CONFIG.timezone,
+    kofiUrl: donors ? CONFIG.kofiUrl : '',
+    currency: CONFIG.donors.currency,
+  };
+  // Function replacers, so a `$` in the station name is not read as a replacement pattern.
+  return webPageCache.html
+    .replace(/%STATION%/g, () => escapeHtml(CONFIG.name))
+    .replace('<!--RADIO_CONFIG-->', () => `<script>window.RADIO=${JSON.stringify(config).replace(/</g, '\\u003c')}</script>`);
+}
+
+function serveWeb(req, res, urlPath) {
+  const rel = decodeURIComponent(urlPath.slice('/web/'.length));
+  const abs = path.resolve(CONFIG.webDir, rel);
+  const type = WEB_TYPES[path.extname(abs).toLowerCase()];
+  if (!type || !abs.startsWith(path.resolve(CONFIG.webDir) + path.sep) || rel.includes('..')) return sendText(req, res, 404, '404 Not found');
+  fs.stat(abs, (err, stats) => {
+    if (err || !stats.isFile()) return sendText(req, res, 404, '404 Not found');
+    res.writeHead(200, { 'Content-Type': type, 'Content-Length': stats.size, 'Cache-Control': 'public, max-age=3600' });
+    if (req.method === 'HEAD') return res.end();
+    fs.createReadStream(abs).on('error', () => res.destroy()).pipe(res);
+  });
+}
+
 function pageHtml(req) {
   const url = streamUrl(req);
   const hlsUrl = url.replace(CONFIG.mount, '') + '/hls/live.m3u8';
@@ -2535,6 +2584,7 @@ function createServer(playout, broadcaster, importer, hlsAudience, exporter, don
         stream: { url: streamUrl(req), format: 'mp3', bitrate: CONFIG.bitrate, sampleRate: CONFIG.sampleRate, hls: CONFIG.hls ? `${streamUrl(req).replace(CONFIG.mount, '')}/hls/live.m3u8` : null },
         encoderRestarts: playout.encoder.restarts,
         import: importer ? importer.status() : null,
+        donors: donors ? donors.board() : null,
         memoryMB: Math.round(process.memoryUsage().rss / 1048576),
         burstBufferKB: Math.round(broadcaster.ring.reduce((a, r) => a + r.buf.length, 0) / 1024),
       });
@@ -2546,13 +2596,14 @@ function createServer(playout, broadcaster, importer, hlsAudience, exporter, don
     if (p === '/health') return sendText(req, res, 200, 'ok');
 
     if (p === '/' || p === '/index.html') {
-      const html = pageHtml(req);
+      const html = webPageHtml(req, donors) || pageHtml(req);
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(html), 'Cache-Control': 'no-store' });
       res.end(req.method === 'HEAD' ? undefined : html);
       return logReq(req, 200);
     }
 
     if (CONFIG.hls && p.startsWith('/hls/')) return serveHls(req, res, p, hlsAudience);
+    if (p.startsWith('/web/')) return serveWeb(req, res, p);
     if (p.startsWith('/exports/')) return serveExport(req, res, p);
 
     if (importer && p.startsWith('/spotify/')) {

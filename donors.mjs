@@ -71,6 +71,7 @@ export function createDonors({ CONFIG, logInfo, logWarn, logErr }) {
   let state = emptyState();
   let usable = true;   // false when the state file exists but cannot be read: never overwrite it
   let published = [];
+  let board = [];
 
   if (fs.existsSync(cfg.stateFile)) {
     try {
@@ -82,12 +83,13 @@ export function createDonors({ CONFIG, logInfo, logWarn, logErr }) {
   }
 
   function rebuild() {
-    published = Object.values(state.donors)
+    board = Object.values(state.donors)
       .filter(d => !isHiddenName(d.name) && cleanName(d.name).length > 0)
       // Arcade rule for ties: whoever got to that score first stays above.
       .sort((a, b) => b.cents - a.cents || String(a.lastAt).localeCompare(String(b.lastAt)) || a.name.localeCompare(b.name))
       .slice(0, cfg.boardSize)
-      .map((d, i) => `donor${i + 1}=${(d.cents / 100).toFixed(2)}|${cleanName(d.name)}`);
+      .map(d => ({ name: cleanName(d.name), amount: (d.cents / 100).toFixed(2) }));
+    published = board.map((d, i) => `donor${i + 1}=${d.amount}|${d.name}`);
   }
   rebuild();
 
@@ -151,6 +153,8 @@ export function createDonors({ CONFIG, logInfo, logWarn, logErr }) {
   return {
     // `donorN=amount|name` lines for /now.txt.
     lines: () => published,
+    // The same rows as objects, for /now.json and the web page.
+    board: () => board,
 
     async handleWebhook(req, res, sendText) {
       if (req.method !== 'POST') return sendText(req, res, 405, 'POST required');
